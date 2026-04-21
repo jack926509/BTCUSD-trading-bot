@@ -26,37 +26,33 @@ class OrderExecutor:
         self.tg                   = tg
         self._limit_order_timeout = limit_order_timeout
 
-        # fill_events: order_id → asyncio.Event（由 trade_updates WS 觸發）
-        self.fill_events:  dict[str, asyncio.Event] = {}
-        self.fill_results: dict[str, object]        = {}
-
-    # ── trade_updates 事件驅動 ────────────────────────────────────────────────
+    # ── Fill detection (REST polling) ─────────────────────────────────────────
 
     async def on_trade_update(self, update):
-        """由 TradingStream 回調，觸發對應的 fill_event"""
-        order_id = str(update.order.id)
-        if order_id in self.fill_events:
-            self.fill_results[order_id] = update
-            self.fill_events[order_id].set()
+        """Kept as no-op for API compatibility; fill detection uses REST polling."""
+        pass
 
     async def _wait_fill_event(self, order_id: str, timeout: int):
-        """等待 trade_updates WS 推送成交事件"""
-        event = asyncio.Event()
-        self.fill_events[order_id] = event
-        try:
-            await asyncio.wait_for(event.wait(), timeout=timeout)
-            update = self.fill_results.pop(order_id, None)
-            if update and update.order.status == OrderStatus.FILLED:
-                return update.order
-            raise OrderError(
-                f"訂單非成交狀態：{update.order.status if update else 'unknown'}"
-            )
-        except asyncio.TimeoutError:
-            raise asyncio.TimeoutError(f"等待成交超時：{order_id}")
-        finally:
-            # FIX P1-3: 同時清理 fill_events 與 fill_results，避免殘留污染下次重試
-            self.fill_events.pop(order_id, None)
-            self.fill_results.pop(order_id, None)
+        """Poll REST API every 2 s until the order fills or timeout expires.
+
+        Replaces the previous TradingStream WebSocket approach, which required
+        a second WebSocket connection that exceeds Alpaca paper trading's
+        1-connection-per-API-key limit.
+        """
+        deadline = asyncio.get_event_loop().time() + timeout
+        while asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(2)
+            try:
+                order = self.client.get_order_by_id(order_id)
+            except Exception as e:
+                print(f"[WARN] get_order_by_id({order_id}): {e}")
+                continue
+            if order.status == OrderStatus.FILLED:
+                return order
+            if order.status in (OrderStatus.CANCELED, OrderStatus.EXPIRED,
+                                OrderStatus.REJECTED):
+                raise OrderError(f"訂單非成交狀態：{order.status}")
+        raise asyncio.TimeoutError(f"等待成交超時：{order_id}")
 
     # ── 進場（預設限價單） ─────────────────────────────────────────────────────
 

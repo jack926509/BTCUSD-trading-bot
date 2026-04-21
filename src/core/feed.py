@@ -4,11 +4,8 @@ import traceback
 
 from alpaca.data.live import CryptoDataStream
 from alpaca.trading.client import TradingClient
-from alpaca.trading.stream import TradingStream
 
 RECONNECT_DELAYS = [1, 2, 4, 8, 16, 30, 60]
-# When Alpaca rejects with "connection limit exceeded", the stale connection
-# from a previous deployment typically expires within 60–90 seconds.
 CONN_LIMIT_DELAY = 90
 
 
@@ -17,17 +14,24 @@ def _is_conn_limit(e: Exception) -> bool:
 
 
 class DataFeed:
+    """Single-WebSocket data feed (CryptoDataStream only).
+
+    Alpaca paper trading enforces a 1-connection-per-API-key limit.
+    TradingStream has been removed; order fill detection is handled via
+    REST polling in OrderExecutor._wait_fill_event instead.
+    """
+
     def __init__(self, on_tick, on_candle_close, on_trade_update,
                  position_mgr, tg):
         self.api_key    = os.getenv("ALPACA_API_KEY")
         self.secret_key = os.getenv("ALPACA_SECRET_KEY")
         self.is_paper   = os.getenv("ALPACA_PAPER_MODE", "true").lower() == "true"
 
-        self.on_tick          = on_tick
-        self.on_candle_close  = on_candle_close
-        self.on_trade_update  = on_trade_update
-        self.position_mgr     = position_mgr
-        self.tg               = tg
+        self.on_tick         = on_tick
+        self.on_candle_close = on_candle_close
+        # on_trade_update kept in signature for API compatibility but unused
+        self.position_mgr    = position_mgr
+        self.tg              = tg
 
         self.trading_client = TradingClient(
             api_key    = self.api_key,
@@ -35,19 +39,11 @@ class DataFeed:
             paper      = self.is_paper,
         )
 
-        # Keep references so stop() can close them explicitly on SIGTERM
-        self._crypto_stream:  CryptoDataStream | None = None
-        self._trading_stream: TradingStream    | None = None
-        self._trading_task:   asyncio.Task     | None = None
+        self._crypto_stream: CryptoDataStream | None = None
 
     # ── Public ────────────────────────────────────────────────────────────────
 
     async def start(self):
-        # Delay TradingStream by 5 s so CryptoDataStream occupies its slot
-        # first; reduces the chance of both hitting the server simultaneously
-        # on a fresh deployment.
-        self._trading_task = asyncio.create_task(self._run_trading_stream(initial_delay=5))
-
         attempt = 0
         while True:
             try:
@@ -61,7 +57,7 @@ class DataFeed:
                         f"waiting {delay}s for stale connection to expire"
                     )
                     await self.tg.alert(
-                        f"⚠️ WebSocket 連線數已達上限，等待 {delay}s 後重連（舊連線過期中）",
+                        f"⚠️ WebSocket 連線數已達上限，等待 {delay}s 後重連",
                         level="WARNING",
                     )
                 else:
@@ -73,64 +69,23 @@ class DataFeed:
                         await self.tg.notify_ws_disconnect(attempt + 1, delay, pos_snapshot)
                     else:
                         await self.tg.alert(
-                            f"⚠️ CryptoDataStream 斷線（第 {attempt + 1} 次），{delay}s 後重連\n錯誤：{repr(e)}",
+                            f"⚠️ CryptoDataStream 斷線（第 {attempt + 1} 次），{delay}s 後重連\n"
+                            f"錯誤：{repr(e)}",
                             level="WARNING",
                         )
                 await asyncio.sleep(delay)
                 attempt += 1
 
     async def stop(self):
-        """Explicitly close both WebSocket streams on graceful shutdown."""
-        for stream, name in [
-            (self._crypto_stream,  "CryptoDataStream"),
-            (self._trading_stream, "TradingStream"),
-        ]:
-            if stream is not None:
-                try:
-                    await stream._stop_ws()
-                    print(f"[FEED] {name} closed")
-                except Exception as e:
-                    print(f"[FEED] {name} close error (ignored): {e}")
-
-        if self._trading_task and not self._trading_task.done():
-            self._trading_task.cancel()
-
-    # ── Internal streams ──────────────────────────────────────────────────────
-
-    async def _run_trading_stream(self, initial_delay: int = 0):
-        """TradingStream 獨立重連迴圈。"""
-        if initial_delay:
-            await asyncio.sleep(initial_delay)
-
-        attempt = 0
-        while True:
+        """Explicitly close WebSocket on graceful shutdown."""
+        if self._crypto_stream is not None:
             try:
-                stream = TradingStream(
-                    api_key    = self.api_key,
-                    secret_key = self.secret_key,
-                    paper      = self.is_paper,
-                )
-                self._trading_stream = stream
-                stream.subscribe_trade_updates(self.on_trade_update)
-                print("WebSocket trade_updates connecting...")
-                await stream._run_forever()
-                attempt = 0
-            except asyncio.CancelledError:
-                print("[FEED] TradingStream task cancelled")
-                return
+                await self._crypto_stream._stop_ws()
+                print("[FEED] CryptoDataStream closed")
             except Exception as e:
-                if _is_conn_limit(e):
-                    delay = CONN_LIMIT_DELAY
-                    print(
-                        f"[WARN] TradingStream: connection limit exceeded — "
-                        f"waiting {delay}s for stale connection to expire"
-                    )
-                else:
-                    delay = RECONNECT_DELAYS[min(attempt, len(RECONNECT_DELAYS) - 1)]
-                    print(f"[ERROR] TradingStream crashed (attempt {attempt + 1}): {repr(e)}")
-                    print(traceback.format_exc())
-                await asyncio.sleep(delay)
-                attempt += 1
+                print(f"[FEED] CryptoDataStream close error (ignored): {e}")
+
+    # ── Internal ──────────────────────────────────────────────────────────────
 
     async def _connect_and_stream(self):
         stream = CryptoDataStream(
@@ -148,8 +103,6 @@ class DataFeed:
     async def _deferred_reconcile(self):
         await asyncio.sleep(0)
         await self._reconcile_positions()
-
-    # ── Callbacks ─────────────────────────────────────────────────────────────
 
     async def _on_trade(self, trade):
         await self.on_tick(trade.symbol, float(trade.price))
