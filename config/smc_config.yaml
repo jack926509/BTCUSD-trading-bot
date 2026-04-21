@@ -3,7 +3,7 @@ version: "7.0"
 timeframes:
   htf: "H4"
   mtf: "H1"
-  ltf: "M15"
+  ltf: "M5"
 
 htf_bars: 200
 ltf_bars: 100

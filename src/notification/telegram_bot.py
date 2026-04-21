@@ -128,7 +128,7 @@ class TelegramNotifier:
             f"{'─' * 24}\n"
             f"🔒 止損移至　<b>${pos.entry_price:,.0f}</b>（成本，已鎖利）\n"
             f"🏁 追蹤目標　${tp2:,.0f}\n"
-            f"📈 Trailing SL 啟動（M15 Swing Pivot 3 根確認）\n"
+            f"📈 Trailing SL 啟動（M5 Swing Pivot 3 根確認）\n"
             f"⏰ {_now_utc()}"
         )
         await self._send(text)

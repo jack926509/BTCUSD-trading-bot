@@ -21,7 +21,7 @@ class SMCSignal:
     invalidation_level: float = 0.0
     rrr:                float = 0.0
     price_at_signal:    float = 0.0
-    timeframe:          str   = "M15"
+    timeframe:          str   = "M5"
     conditions_met:     list  = field(default_factory=list)
     reject_reason:      str   = ""
     # BOS / CHoCH specific
@@ -53,7 +53,7 @@ class SMCEngine:
 
         self.htf = self._cfg["timeframes"]["htf"]   # H4
         self.mtf = self._cfg["timeframes"]["mtf"]   # H1
-        self.ltf = self._cfg["timeframes"]["ltf"]   # M15
+        self.ltf = self._cfg["timeframes"]["ltf"]   # M5
 
         # 每個 symbol 的 K 棒緩存
         self._bars:       dict = defaultdict(lambda: defaultdict(lambda: deque(maxlen=300)))
