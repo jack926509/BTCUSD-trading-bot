@@ -392,6 +392,10 @@ class TradingSystem:
     async def _graceful_shutdown(self):
         await self.tg.alert("🔴 Trading System 正在關閉（SIGTERM）", level="WARNING")
         try:
+            await self.feed.stop()
+        except Exception:
+            pass
+        try:
             await self.circuit._persist(self.db)
         except Exception:
             pass
