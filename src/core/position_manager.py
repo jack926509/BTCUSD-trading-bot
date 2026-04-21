@@ -36,6 +36,7 @@ class Position:
     structural_buffer:   float           = 50.0
     min_trail_pct:       float           = 0.003
     last_pnl:            float           = 0.0
+    realized_pnl:        float           = 0.0   # 累計已實現 PnL（TP1 後更新）
 
     # Rolling candle window for trailing stop
     _candle_buffer: deque = field(default_factory=lambda: deque(maxlen=20))
@@ -53,6 +54,15 @@ class Position:
             return close_price <= self.invalidation_level
         else:
             return close_price >= self.invalidation_level
+
+    def is_trailing_sl_triggered(self, close_price: float) -> bool:
+        """Trailing 期間：K 棒收盤跌破 stop_loss 則觸發"""
+        if self.state != PositionState.TRAILING:
+            return False
+        if self.side == "BUY":
+            return close_price <= self.stop_loss
+        else:
+            return close_price >= self.stop_loss
 
     def is_tp1_hit(self, price: float) -> bool:
         if self.side == "BUY":
@@ -107,18 +117,23 @@ class Position:
 
 
 class PositionManager:
-    def __init__(self, on_close, db, tg, smc):
+    def __init__(self, on_close, db, tg, smc, circuit=None):
         self.positions:  dict = {}
         self._on_close       = on_close
         self.db              = db
         self.tg              = tg
         self.smc             = smc
-        self.executor        = None  # set by TradingSystem after init
+        self.circuit         = circuit   # FIX P0-1/P0-2: injected by TradingSystem
+        self.executor        = None      # set by TradingSystem after init
 
         config_dir   = os.getenv("CONFIG_DIR", "/app/config")
         rules_path   = os.path.join(config_dir, "position_rules.yaml")
-        with open(rules_path, "r") as f:
-            rules    = yaml.safe_load(f)
+        try:
+            with open(rules_path, "r") as f:
+                rules = yaml.safe_load(f)
+        except FileNotFoundError:
+            print(f"[WARN] position_rules.yaml not found at {rules_path}, using defaults")
+            rules = {}
 
         self._tp_enabled     = rules.get("partial_tp", {}).get("enabled", True)
         self._tp1_close_pct  = rules.get("partial_tp", {}).get("tp1_close_pct", 0.5)
@@ -162,7 +177,7 @@ class PositionManager:
             hard_sl_price       = signal.hard_sl_price,
             take_profit         = signal.take_profit_1,
         )
-        pos.trade_id    = trade_id
+        pos.trade_id           = trade_id
         self.positions[symbol] = pos
         return pos
 
@@ -173,7 +188,7 @@ class PositionManager:
         if not pos or pos.state not in (PositionState.OPEN, PositionState.TRAILING):
             return
 
-        # TP1 check
+        # TP1 check（只在 OPEN 態，避免重複觸發）
         if self._tp_enabled and pos.state == PositionState.OPEN and pos.is_tp1_hit(price):
             pos.state = PositionState.TRAILING
             asyncio.create_task(self._execute_tp1(pos, price))
@@ -185,20 +200,30 @@ class PositionManager:
             asyncio.create_task(self._execute_hard_sl_close(pos, price))
 
     async def _execute_tp1(self, pos: Position, price: float):
+        """FIX P1-1: 實際送減倉單；FIX P1-2: 更新 last_pnl"""
         if not self.executor:
             return
         try:
             close_qty = round(pos.qty * self._tp1_close_pct, 8)
             realized  = (price - pos.entry_price) * close_qty if pos.side == "BUY" else \
                         (pos.entry_price - price) * close_qty
-            pos.qty  -= close_qty
-            pos.stop_loss = pos.entry_price  # Move SL to entry
+
+            # 實際送減倉市價單到 Alpaca
+            await self.executor.partial_close(pos.symbol, pos.side, close_qty)
+
+            pos.qty          -= close_qty
+            pos.realized_pnl += realized
+            pos.last_pnl      = realized            # FIX P1-2
+            pos.stop_loss     = pos.entry_price     # Move SL to entry（已鎖利）
+
+            self.tg.mark_state_changed("SL_MOVED")  # FIX P1-7: sync call, no create_task
             asyncio.create_task(self.tg.notify_tp1(pos.symbol, pos, realized))
-            self.tg.mark_state_changed("SL_MOVED")
         except Exception as e:
-            await self.tg.alert(f"⚠️ TP1 處理失敗：{e}", level="WARNING")
+            pos.state = PositionState.OPEN  # 回滾狀態，下次 tick 可重試
+            await self.tg.alert(f"⚠️ TP1 減倉失敗：{e}", level="WARNING")
 
     async def _execute_hard_sl_close(self, pos: Position, trigger_price: float):
+        """FIX P0-1/P0-2: circuit.record；FIX P0-4: await db/tg"""
         if not self.executor:
             return
         try:
@@ -206,16 +231,24 @@ class PositionManager:
             fill  = float(getattr(order, "filled_avg_price", trigger_price) or trigger_price)
             pos.last_pnl = (fill - pos.entry_price) * pos.qty if pos.side == "BUY" else \
                            (pos.entry_price - fill) * pos.qty
-            from src.risk.circuit_breaker import CircuitBreaker
-            asyncio.create_task(self.db.close_position(pos, "HARD_SL", order))
-            asyncio.create_task(
-                self.tg.notify_close(
-                    pos, "HARD_SL",
-                    extra=f"插針觸發價：${trigger_price:,.0f}\n出場成交：${fill:,.0f}（市價）\n虧損：−${abs(pos.last_pnl):,.0f}"
-                )
+
+            # FIX P0-1/P0-2: 直接呼叫 circuit.record，不透過 callback
+            if self.circuit:
+                self.circuit.record("HARD_SL")
+
+            # FIX P0-4: await 確保關鍵資料寫入 DB 再刪除持倉
+            try:
+                await self.db.close_position(pos, "HARD_SL", order)
+            except Exception as db_err:
+                await self.tg.alert(f"⚠️ Hard SL DB 寫入失敗：{db_err}", level="WARNING")
+
+            await self.tg.notify_close(
+                pos, "HARD_SL",
+                extra=f"插針觸發價：${trigger_price:,.0f}\n出場成交：${fill:,.0f}（市價）\n虧損：−${abs(pos.last_pnl):,.0f}"
             )
-            del self.positions[pos.symbol]
+            self.positions.pop(pos.symbol, None)
         except Exception as e:
+            pos.state = PositionState.OPEN  # 回滾，允許下次 tick 重試
             await self.tg.alert(f"🔴 Hard SL 出場失敗：{e}", level="CRITICAL")
 
     # ── Candle Close Handler (Fast Track) ────────────────────────────────────
@@ -231,18 +264,24 @@ class PositionManager:
             if pos.state == PositionState.CLOSING:
                 return
 
-        # INVALIDATED check (candle close)
+        # INVALIDATED check（收盤確認）
         if pos.is_invalidated(candle["close"]):
             pos.state = PositionState.CLOSING
             asyncio.create_task(self._execute_invalidated_close(pos, candle))
             return
 
-        # Trailing stop update
+        # Trailing stop: 收盤跌破 stop_loss → TRAILING_SL 出場
+        if pos.is_trailing_sl_triggered(candle["close"]):
+            pos.state = PositionState.CLOSING
+            asyncio.create_task(self._execute_trailing_sl_close(pos, candle))
+            return
+
+        # Trailing stop level 更新
         if pos.state == PositionState.TRAILING:
             old_sl = pos.stop_loss
             pos.update_structural_trailing(candle)
             if pos.stop_loss != old_sl:
-                asyncio.create_task(self.tg.mark_state_changed("SL_MOVED"))
+                self.tg.mark_state_changed("SL_MOVED")  # FIX P1-7: sync call
 
         # Max hold check
         elapsed_h = (datetime.now(timezone.utc) - pos.open_time).total_seconds() / 3600
@@ -269,25 +308,75 @@ class PositionManager:
             )
 
     async def _execute_invalidated_close(self, pos: Position, candle: dict):
+        """FIX P0-1/P0-2: circuit.record；FIX P0-4: await db/tg"""
         if not self.executor:
             return
         try:
             order = await self.executor.close_position(pos)
-            asyncio.create_task(self.db.close_position(pos, "INVALIDATED", order))
-            asyncio.create_task(self.tg.notify_close(pos, "INVALIDATED"))
-            del self.positions[pos.symbol]
+            fill  = float(getattr(order, "filled_avg_price", candle["close"]) or candle["close"])
+            pos.last_pnl = (fill - pos.entry_price) * pos.qty if pos.side == "BUY" else \
+                           (pos.entry_price - fill) * pos.qty
+
+            if self.circuit:
+                self.circuit.record("INVALIDATED")
+
+            try:
+                await self.db.close_position(pos, "INVALIDATED", order)
+            except Exception as db_err:
+                await self.tg.alert(f"⚠️ INVALIDATED DB 寫入失敗：{db_err}", level="WARNING")
+
+            await self.tg.notify_close(pos, "INVALIDATED")
+            self.positions.pop(pos.symbol, None)
         except Exception as e:
+            pos.state = PositionState.OPEN
             await self.tg.alert(f"🔴 INVALIDATED 平倉失敗：{e}", level="CRITICAL")
 
-    async def _execute_htf_flip_close(self, pos: Position):
+    async def _execute_trailing_sl_close(self, pos: Position, candle: dict):
+        """Trailing SL 收盤確認出場"""
         if not self.executor:
             return
         try:
             order = await self.executor.close_position(pos)
-            asyncio.create_task(self.db.close_position(pos, "HTF_FLIP", order))
-            asyncio.create_task(self.tg.notify_close(pos, "HTF_FLIP"))
-            del self.positions[pos.symbol]
+            fill  = float(getattr(order, "filled_avg_price", candle["close"]) or candle["close"])
+            pos.last_pnl = (fill - pos.entry_price) * pos.qty if pos.side == "BUY" else \
+                           (pos.entry_price - fill) * pos.qty
+
+            if self.circuit:
+                self.circuit.record("TRAILING_SL")
+
+            try:
+                await self.db.close_position(pos, "TRAILING_SL", order)
+            except Exception as db_err:
+                await self.tg.alert(f"⚠️ TRAILING_SL DB 寫入失敗：{db_err}", level="WARNING")
+
+            await self.tg.notify_close(pos, "TRAILING_SL")
+            self.positions.pop(pos.symbol, None)
         except Exception as e:
+            pos.state = PositionState.TRAILING
+            await self.tg.alert(f"🔴 TRAILING_SL 平倉失敗：{e}", level="CRITICAL")
+
+    async def _execute_htf_flip_close(self, pos: Position):
+        """FIX P0-1/P0-2: circuit.record；FIX P0-4: await db/tg"""
+        if not self.executor:
+            return
+        try:
+            order = await self.executor.close_position(pos)
+            fill  = float(getattr(order, "filled_avg_price", pos.entry_price) or pos.entry_price)
+            pos.last_pnl = (fill - pos.entry_price) * pos.qty if pos.side == "BUY" else \
+                           (pos.entry_price - fill) * pos.qty
+
+            if self.circuit:
+                self.circuit.record("HTF_FLIP")
+
+            try:
+                await self.db.close_position(pos, "HTF_FLIP", order)
+            except Exception as db_err:
+                await self.tg.alert(f"⚠️ HTF_FLIP DB 寫入失敗：{db_err}", level="WARNING")
+
+            await self.tg.notify_close(pos, "HTF_FLIP")
+            self.positions.pop(pos.symbol, None)
+        except Exception as e:
+            pos.state = PositionState.OPEN
             await self.tg.alert(f"🔴 HTF_FLIP 平倉失敗：{e}", level="CRITICAL")
 
     # ── Reconciliation ────────────────────────────────────────────────────────
@@ -296,23 +385,42 @@ class PositionManager:
         return len(self.positions) > 0
 
     async def adopt_orphan(self, symbol: str, pos_data):
-        """接管 Alpaca 上存在但本地未追蹤的持倉"""
+        """FIX P1-4: 接管 Alpaca 持倉並寫入 DB"""
         try:
-            qty        = float(pos_data.qty)
-            avg_entry  = float(pos_data.avg_entry_price)
-            side       = "BUY" if pos_data.side.value == "long" else "SELL"
+            qty       = float(pos_data.qty)
+            avg_entry = float(pos_data.avg_entry_price)
+            side      = "BUY" if pos_data.side.value == "long" else "SELL"
+
             pos = Position(
-                symbol            = symbol,
-                side              = side,
-                entry_price       = avg_entry,
-                qty               = qty,
-                notional          = qty * avg_entry,
-                stop_loss         = avg_entry * (0.98 if side == "BUY" else 1.02),
-                hard_sl_price     = avg_entry * (0.977 if side == "BUY" else 1.023),
-                take_profit_1     = avg_entry * (1.04 if side == "BUY" else 0.96),
-                take_profit_2     = avg_entry * (1.06 if side == "BUY" else 0.94),
-                invalidation_level= avg_entry * (0.975 if side == "BUY" else 1.025),
+                symbol             = symbol,
+                side               = side,
+                entry_price        = avg_entry,
+                qty                = qty,
+                notional           = qty * avg_entry,
+                stop_loss          = avg_entry * (0.98 if side == "BUY" else 1.02),
+                hard_sl_price      = avg_entry * (0.977 if side == "BUY" else 1.023),
+                take_profit_1      = avg_entry * (1.04 if side == "BUY" else 0.96),
+                take_profit_2      = avg_entry * (1.06 if side == "BUY" else 0.94),
+                invalidation_level = avg_entry * (0.975 if side == "BUY" else 1.025),
             )
+
+            # FIX P1-4: 寫入 DB，確保平倉時有 trade_id 可記錄
+            try:
+                trade_id = await self.db.open_trade(
+                    analysis_id  = 0,
+                    symbol       = symbol,
+                    side         = side,
+                    notional     = qty * avg_entry,
+                    fill_price   = avg_entry,
+                    limit_price  = avg_entry,
+                    stop_loss    = pos.stop_loss,
+                    hard_sl_price= pos.hard_sl_price,
+                    take_profit  = pos.take_profit_1,
+                )
+                pos.trade_id = trade_id
+            except Exception as db_err:
+                await self.tg.alert(f"⚠️ adopt_orphan DB 寫入失敗：{db_err}", level="WARNING")
+
             self.positions[symbol] = pos
         except Exception as e:
             await self.tg.alert(f"⚠️ adopt_orphan 失敗：{e}", level="WARNING")

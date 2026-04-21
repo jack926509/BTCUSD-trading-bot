@@ -1,5 +1,7 @@
 import asyncio
 import os
+import signal
+import sys
 
 from dotenv import load_dotenv
 
@@ -30,40 +32,47 @@ class TradingSystem:
         self.smc     = SMCEngine()
         self.risk    = RiskManager()
 
+        # FIX P0-1/P0-2: 將 circuit 注入 PositionManager，讓各 close 路徑可直接呼叫
         self.position_mgr = PositionManager(
             on_close = self._on_position_close,
             db       = self.db,
             tg       = self.tg,
             smc      = self.smc,
+            circuit  = self.circuit,
         )
         self.executor = OrderExecutor(
             position_mgr = self.position_mgr,
             db           = self.db,
             tg           = self.tg,
         )
-        # Wire executor into position_mgr
         self.position_mgr.executor = self.executor
 
-        config_dir  = os.getenv("CONFIG_DIR", "/app/config")
-        smc_path    = os.path.join(config_dir, "smc_config.yaml")
-        with open(smc_path, "r") as f:
-            smc_cfg = yaml.safe_load(f)
+        config_dir = os.getenv("CONFIG_DIR", "/app/config")
+        smc_path   = os.path.join(config_dir, "smc_config.yaml")
+        try:
+            with open(smc_path, "r") as f:
+                smc_cfg = yaml.safe_load(f)
+        except FileNotFoundError:
+            print(f"[ERROR] smc_config.yaml not found at {smc_path}")
+            sys.exit(1)
 
         self.claude   = ClaudeClient(config=smc_cfg)
-        self.ai_queue = AnalysisQueue(max_size=50)
+        # FIX P2-1: 傳入 tg，讓佇列滿時可推播告警
+        self.ai_queue = AnalysisQueue(max_size=50, tg=self.tg)
 
-        # CandleBuilder bridges M1 bars → on_candle_close
         self.candle_builder = CandleBuilder(
             on_candle_close=self._on_aggregated_candle_close
         )
 
         self.feed = DataFeed(
-            on_tick          = self._on_tick,
-            on_candle_close  = self._on_raw_bar,
-            on_trade_update  = self.executor.on_trade_update,
-            position_mgr     = self.position_mgr,
-            tg               = self.tg,
+            on_tick         = self._on_tick,
+            on_candle_close = self._on_raw_bar,
+            on_trade_update = self.executor.on_trade_update,
+            position_mgr    = self.position_mgr,
+            tg              = self.tg,
         )
+
+        self._shutdown = False
 
     # ── Startup ───────────────────────────────────────────────────────────────
 
@@ -71,11 +80,16 @@ class TradingSystem:
         print("Trading System v7.0 starting...")
 
         await self._check_volume()
-        await self.db.connect()
+
+        # FIX P2-3: DB 連線加重試
+        await self._connect_db_with_retry()
+
         await self.circuit.load_state(self.db)
-        # Pass db and tg references for persist fallback
         self.circuit.db = self.db
         self.circuit.tg = self.tg
+
+        # FIX P1-5: 啟動時從 Alpaca 取得帳戶淨值
+        await self._refresh_equity()
 
         await self.executor.scan_orphan_orders_on_startup()
 
@@ -84,11 +98,36 @@ class TradingSystem:
             self.circuit.state, mode="PAPER" if is_paper else "LIVE"
         )
 
-        # Seed historical bars for HTF / MTF structure
         await self._seed_historical_bars()
 
+    async def _connect_db_with_retry(self, max_attempts: int = 5):
+        """FIX P2-3: DB 連線失敗時指數退避重試"""
+        for attempt in range(max_attempts):
+            try:
+                await self.db.connect()
+                print("[BOOT] Database connected")
+                return
+            except Exception as e:
+                wait = 2 ** attempt
+                print(f"[BOOT] DB connect failed (attempt {attempt+1}): {e}，{wait}s 後重試")
+                if attempt == max_attempts - 1:
+                    await self.tg.alert(
+                        f"🔴 DB 連線失敗（{max_attempts} 次後放棄）：{e}", level="CRITICAL"
+                    )
+                    sys.exit(1)
+                await asyncio.sleep(wait)
+
+    async def _refresh_equity(self):
+        """FIX P1-5: 取得 Alpaca 帳戶淨值並注入 RiskManager"""
+        try:
+            account = self.executor.client.get_account()
+            equity  = float(account.equity)
+            self.risk.set_equity(equity)
+            print(f"[BOOT] Account equity: ${equity:,.2f}")
+        except Exception as e:
+            print(f"[WARN] 無法取得帳戶淨值：{e}，使用最低名目金額")
+
     async def _check_volume(self):
-        """偵測 /app/data 是否在已知掛載點"""
         db_path = os.getenv("DB_PATH", "/app/data/trading.db")
         if not any(db_path.startswith(p) for p in KNOWN_VOLUME_PATHS):
             await self.tg.alert(
@@ -108,8 +147,8 @@ class TradingSystem:
             from alpaca.data.timeframe import TimeFrame
             from datetime import datetime, timezone, timedelta
 
-            api_key    = os.getenv("ALPACA_API_KEY")
-            secret_key = os.getenv("ALPACA_SECRET_KEY")
+            api_key     = os.getenv("ALPACA_API_KEY")
+            secret_key  = os.getenv("ALPACA_SECRET_KEY")
             hist_client = CryptoHistoricalDataClient(
                 api_key=api_key, secret_key=secret_key
             )
@@ -127,19 +166,18 @@ class TradingSystem:
                     })
                 return result
 
-            # Seed H4 bars (HTF)
-            req_h4 = CryptoBarsRequest(
+            # Seed H1 / H4
+            req_h1 = CryptoBarsRequest(
                 symbol_or_symbols = "BTC/USD",
                 timeframe         = TimeFrame.Hour,
                 start             = datetime.now(timezone.utc) - timedelta(days=60),
-                limit             = 250,
+                limit             = 1500,
             )
-            bars_h4 = hist_client.get_crypto_bars(req_h4)
-            df_h4   = bars_h4.df
-            if not df_h4.empty:
-                # Aggregate hourly into H4
+            bars_h1 = hist_client.get_crypto_bars(req_h1)
+            df_h1   = bars_h1.df
+            if not df_h1.empty:
+                hourly = bars_to_dicts(df_h1)
                 h4_bars = []
-                hourly  = bars_to_dicts(df_h4)
                 for i in range(0, len(hourly) - 3, 4):
                     chunk = hourly[i:i + 4]
                     h4_bars.append({
@@ -154,17 +192,17 @@ class TradingSystem:
                 self.smc.seed_bars("BTC/USD", "H1", hourly[-200:])
                 print(f"Seeded H4: {len(h4_bars)} bars, H1: {len(hourly)} bars")
 
-            # Seed M15 bars (LTF) using 1-hour then downsample from M1 in live
-            req_m15 = CryptoBarsRequest(
+            # Seed M15
+            req_m1 = CryptoBarsRequest(
                 symbol_or_symbols = "BTC/USD",
                 timeframe         = TimeFrame.Minute,
                 start             = datetime.now(timezone.utc) - timedelta(days=5),
-                limit             = 500,
+                limit             = 7200,
             )
-            bars_m15 = hist_client.get_crypto_bars(req_m15)
-            df_m15   = bars_m15.df
-            if not df_m15.empty:
-                m1_bars = bars_to_dicts(df_m15)
+            bars_m1 = hist_client.get_crypto_bars(req_m1)
+            df_m1   = bars_m1.df
+            if not df_m1.empty:
+                m1_bars  = bars_to_dicts(df_m1)
                 m15_bars = []
                 for i in range(0, len(m1_bars) - 14, 15):
                     chunk = m1_bars[i:i + 15]
@@ -185,37 +223,23 @@ class TradingSystem:
     # ── Tick and Bar Handlers ─────────────────────────────────────────────────
 
     async def _on_tick(self, symbol: str, price: float):
-        """Fast Track: position SL/TP monitoring"""
         await self.position_mgr.on_tick(symbol, price)
 
     async def _on_raw_bar(self, symbol: str, bar):
-        """
-        Alpaca CryptoDataStream 推送的是 1-minute bars。
-        驅動 CandleBuilder 聚合為 M15/H1/H4。
-        """
         await self.candle_builder.on_m1_bar(symbol, bar)
 
     async def _on_aggregated_candle_close(self, symbol: str, tf: str, candle: dict):
-        """CandleBuilder 聚合完成後呼叫"""
         print(f"Candle close: {symbol} {tf}")
 
-        # Position manager candle close handler (trailing stop, invalidation, etc.)
         if tf == self.smc.ltf:
             await self.position_mgr.on_candle_close(symbol, candle)
 
-        # SMC engine update
         ctx = self.smc.update(symbol, tf, candle)
 
-        # Only process LTF signals for entry
         if tf != self.smc.ltf or not ctx.has_candidate():
             return
 
         if self.circuit.is_open():
-            return
-
-        if not self.risk.is_auto_trade_enabled():
-            # Log signal without trading
-            await self.ai_queue.enqueue(symbol, ctx)
             return
 
         await self.ai_queue.enqueue(symbol, ctx)
@@ -223,15 +247,10 @@ class TradingSystem:
     # ── AI Queue Handler ──────────────────────────────────────────────────────
 
     async def _process_ai_job(self, job):
-        """
-        訊號確認 → 立即送限價單 → 進場成交後送伺服器端停損 → Claude 非同步補寫。
-        """
-        # Already have open position? Skip.
         if self.position_mgr.has_open_positions():
             return
 
         if not self.risk.is_auto_trade_enabled():
-            # Log only mode: just do Claude description + DB save
             try:
                 description = await self.claude.describe(job.symbol, job.signal)
                 await self.db.save_analysis(job.symbol, job.signal, description)
@@ -239,11 +258,13 @@ class TradingSystem:
                 pass
             return
 
+        # FIX P1-5: 每次下單前刷新淨值
+        await self._refresh_equity()
+
         notional    = self.risk.calc_notional(job.signal)
         limit_price = job.signal.entry_limit_price
 
         try:
-            # ① 立即送限價單（不等 Claude）
             order = await self.executor.place(
                 job.signal.direction, notional, limit_price
             )
@@ -254,22 +275,19 @@ class TradingSystem:
         if not order:
             return
 
-        # ② 進場成交 → 開立持倉
         pos = await self.position_mgr.open(
             job.symbol, job.signal, order, analysis_id=None
         )
 
-        # ③ 立即送伺服器端保底停損
         server_stop_id = await self.executor.place_server_side_stop(
-            side           = job.signal.direction,
-            qty            = float(order.filled_qty),
-            hard_sl_price  = job.signal.hard_sl_price,
-            buffer_pct     = self.risk.get_server_stop_buffer(),
+            side          = job.signal.direction,
+            qty           = float(order.filled_qty),
+            hard_sl_price = job.signal.hard_sl_price,
+            buffer_pct    = self.risk.get_server_stop_buffer(),
         )
         if server_stop_id:
             pos.server_stop_order_id = server_stop_id
 
-        # ④ Claude 描述 + DB + Telegram（非同步，不阻塞）
         asyncio.create_task(self._async_log_and_notify(job, pos))
 
     async def _async_log_and_notify(self, job, pos):
@@ -289,8 +307,12 @@ class TradingSystem:
     # ── Position Close Callback ───────────────────────────────────────────────
 
     async def _on_position_close(self, pos, reason):
-        if reason in ("INVALIDATED", "HARD_SL", "HTF_FLIP"):
-            return  # 已由 position_manager 獨立處理
+        """
+        此 callback 僅在 PositionManager 未自行處理的出場原因（如 SL、TP）時呼叫。
+        HARD_SL / INVALIDATED / HTF_FLIP / TRAILING_SL 已在 PositionManager 直接處理。
+        """
+        if reason in ("INVALIDATED", "HARD_SL", "HTF_FLIP", "TRAILING_SL"):
+            return
         await self.executor.close_position(pos)
         self.circuit.record(reason)
         await self.db.close_position(pos, reason)
@@ -300,17 +322,14 @@ class TradingSystem:
 
     async def _heartbeat_loop(self):
         """
-        差異化心跳：
-        ① 持倉浮損變化 ±$50
-        ② 熔斷器狀態改變
-        ③ SL 被移動
+        差異化心跳：浮損 ±$50 / 熔斷器變更 / SL 移動 → 立即推播
         其餘靜默，每 4 小時強制推播一次。
         """
         last_forced = asyncio.get_event_loop().time()
         while True:
-            await asyncio.sleep(300)  # 每 5 分鐘檢查一次
+            await asyncio.sleep(300)
             now   = asyncio.get_event_loop().time()
-            force = (now - last_forced) >= 14400  # 4 小時
+            force = (now - last_forced) >= 14400
 
             snapshot = self._build_snapshot()
             if force or self.tg.has_meaningful_state_change(snapshot):
@@ -322,11 +341,9 @@ class TradingSystem:
         float_pnl = 0.0
         pos_info  = "無持倉"
         for symbol, pos in self.position_mgr.positions.items():
-            # Use last known price (no live price in heartbeat)
             float_pnl = pos.last_pnl
             side_str  = "LONG" if pos.side == "BUY" else "SHORT"
             pos_info  = f"{symbol} {side_str} ${pos.entry_price:,.0f}"
-
         return {
             "float_pnl":     float_pnl,
             "breaker_state": self.circuit.state.value,
@@ -334,10 +351,41 @@ class TradingSystem:
             "position_info": pos_info,
         }
 
+    # ── Graceful Shutdown ─────────────────────────────────────────────────────
+
+    def _setup_signal_handlers(self):
+        """FIX P2-9: 攔截 SIGTERM / SIGINT，優雅關閉並持久化熔斷器狀態"""
+        loop = asyncio.get_event_loop()
+
+        def _handle_shutdown(sig_name):
+            if self._shutdown:
+                return
+            self._shutdown = True
+            print(f"\n[SHUTDOWN] 收到 {sig_name}，開始優雅關閉...")
+            asyncio.create_task(self._graceful_shutdown())
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, lambda s=sig: _handle_shutdown(s.name))
+
+    async def _graceful_shutdown(self):
+        await self.tg.alert("🔴 Trading System 正在關閉（SIGTERM）", level="WARNING")
+        # 確保熔斷器狀態寫入 DB
+        try:
+            await self.circuit._persist(self.db)
+        except Exception:
+            pass
+        try:
+            await self.db.close()
+        except Exception:
+            pass
+        print("[SHUTDOWN] 完成，退出")
+        sys.exit(0)
+
     # ── Main Run ──────────────────────────────────────────────────────────────
 
     async def run(self):
         await self.startup()
+        self._setup_signal_handlers()
         await asyncio.gather(
             self.feed.start(),
             self.ai_queue.worker(self._process_ai_job),

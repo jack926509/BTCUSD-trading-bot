@@ -3,6 +3,7 @@ import os
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
     LimitOrderRequest,
+    MarketOrderRequest,
     StopLimitOrderRequest,
     StopOrderRequest,
 )
@@ -52,7 +53,9 @@ class OrderExecutor:
         except asyncio.TimeoutError:
             raise asyncio.TimeoutError(f"等待成交超時：{order_id}")
         finally:
+            # FIX P1-3: 同時清理 fill_events 與 fill_results，避免殘留污染下次重試
             self.fill_events.pop(order_id, None)
+            self.fill_results.pop(order_id, None)
 
     # ── 進場（預設限價單） ─────────────────────────────────────────────────────
 
@@ -70,51 +73,89 @@ class OrderExecutor:
         """
         if stop_price:
             req = StopLimitOrderRequest(
-                symbol          = "BTC/USD",
-                notional        = str(round(notional, 2)),
-                side            = OrderSide.BUY if side == "BUY" else OrderSide.SELL,
-                time_in_force   = TimeInForce.GTC,
-                stop_price      = str(round(stop_price, 2)),
-                limit_price     = str(round(limit_price, 2)),
+                symbol        = "BTC/USD",
+                notional      = str(round(notional, 2)),
+                side          = OrderSide.BUY if side == "BUY" else OrderSide.SELL,
+                time_in_force = TimeInForce.GTC,
+                stop_price    = str(round(stop_price, 2)),
+                limit_price   = str(round(limit_price, 2)),
             )
         else:
             req = LimitOrderRequest(
-                symbol          = "BTC/USD",
-                notional        = str(round(notional, 2)),
-                side            = OrderSide.BUY if side == "BUY" else OrderSide.SELL,
-                time_in_force   = TimeInForce.GTC,
-                limit_price     = str(round(limit_price, 2)),
+                symbol        = "BTC/USD",
+                notional      = str(round(notional, 2)),
+                side          = OrderSide.BUY if side == "BUY" else OrderSide.SELL,
+                time_in_force = TimeInForce.GTC,
+                limit_price   = str(round(limit_price, 2)),
             )
 
+        # FIX P0-3: 在迴圈外初始化，避免 submit_order 失敗時 except 裡出現 NameError
+        order = None
         for attempt in range(3):
             try:
                 order = self.client.submit_order(req)
-                await self.db.record_pending_order(order.id, side, notional)
+                await self.db.record_pending_order(str(order.id), side, notional)
                 result = await self._wait_fill_event(str(order.id), timeout=10)
                 await self.db.confirm_order_filled(str(order.id))
                 return result
             except asyncio.TimeoutError:
-                cancelled = await self._safe_cancel(str(order.id))
-                if not cancelled:
-                    await self._verify_and_handle_order(str(order.id))
+                if order:
+                    cancelled = await self._safe_cancel(str(order.id))
+                    if not cancelled:
+                        await self._verify_and_handle_order(str(order.id))
                 if attempt == 2:
-                    raise OrderError(f"下單超時（3次重試後）: {order.id}")
+                    raise OrderError(f"下單超時（3次重試後）: {order.id if order else 'N/A'}")
                 await asyncio.sleep(0.5 * (2 ** attempt))
             except Exception as e:
                 if attempt == 2:
                     raise OrderError(f"下單失敗：{e}")
                 await asyncio.sleep(0.5 * (2 ** attempt))
 
+    # ── TP1 減倉（市價，FIX P1-1） ────────────────────────────────────────────
+
+    async def partial_close(self, symbol: str, pos_side: str, qty: float) -> object:
+        """
+        FIX P1-1: TP1 部分平倉，送市價單減倉。
+        pos_side: 持倉方向（BUY/SELL），減倉方向相反。
+        """
+        close_side = OrderSide.SELL if pos_side == "BUY" else OrderSide.BUY
+        req = MarketOrderRequest(
+            symbol        = "BTC/USD",
+            qty           = str(round(qty, 8)),
+            side          = close_side,
+            time_in_force = TimeInForce.GTC,
+        )
+        order = None
+        for attempt in range(3):
+            try:
+                order = self.client.submit_order(req)
+                await self.db.record_pending_order(str(order.id), "TP1_PARTIAL", 0)
+                result = await self._wait_fill_event(str(order.id), timeout=15)
+                await self.db.confirm_order_filled(str(order.id))
+                return result
+            except asyncio.TimeoutError:
+                if order:
+                    await self._verify_and_handle_order(str(order.id))
+                if attempt == 2:
+                    raise OrderError(f"TP1 減倉超時: {order.id if order else 'N/A'}")
+                await asyncio.sleep(0.5 * (2 ** attempt))
+            except Exception as e:
+                if attempt == 2:
+                    raise OrderError(f"TP1 減倉失敗：{e}")
+                await asyncio.sleep(0.5 * (2 ** attempt))
+
     # ── 平倉 ──────────────────────────────────────────────────────────────────
 
-    async def close_position(self, pos) -> dict:
+    async def close_position(self, pos) -> object:
         """
         平倉前先取消伺服器端保底停損單。
         平倉訂單也記錄至 pending_orders，防止網路瞬斷造成幽靈持倉。
         """
+        server_stop_cancelled = False
         if hasattr(pos, "server_stop_order_id") and pos.server_stop_order_id:
             try:
                 self.client.cancel_order_by_id(pos.server_stop_order_id)
+                server_stop_cancelled = True
             except Exception:
                 pass  # 若已被觸發則忽略
 
@@ -137,6 +178,22 @@ class OrderExecutor:
                 await asyncio.sleep(0.5 * (2 ** attempt))
             except Exception as e:
                 if attempt == 2:
+                    # FIX P2-5: 若平倉超時且 server stop 已取消，補送新的 server stop
+                    if server_stop_cancelled and hasattr(pos, "hard_sl_price"):
+                        await self.tg.alert(
+                            "🔴 平倉失敗且 server stop 已取消，嘗試補送 server stop",
+                            level="CRITICAL",
+                        )
+                        try:
+                            new_stop_id = await self.place_server_side_stop(
+                                side          = pos.side,
+                                qty           = pos.qty,
+                                hard_sl_price = pos.hard_sl_price,
+                            )
+                            if new_stop_id:
+                                pos.server_stop_order_id = new_stop_id
+                        except Exception:
+                            pass
                     raise OrderError(f"平倉失敗：{e}")
                 await asyncio.sleep(0.5 * (2 ** attempt))
 
