@@ -38,11 +38,16 @@ class DataFeed:
                 attempt = 0
             except Exception as e:
                 delay = RECONNECT_DELAYS[min(attempt, len(RECONNECT_DELAYS) - 1)]
+                print(f"[ERROR] CryptoDataStream crashed (attempt {attempt + 1}): {repr(e)}")
                 if self.position_mgr.has_open_positions():
-                    # 只顯示當前模式 URL
-                    pos_snapshot   = self._build_pos_snapshot()
+                    pos_snapshot = self._build_pos_snapshot()
                     await self.tg.notify_ws_disconnect(
                         attempt + 1, delay, pos_snapshot
+                    )
+                else:
+                    await self.tg.alert(
+                        f"⚠️ CryptoDataStream 斷線（第 {attempt + 1} 次），{delay}s 後重連\n錯誤：{repr(e)}",
+                        level="WARNING",
                     )
                 await asyncio.sleep(delay)
                 attempt += 1
@@ -59,9 +64,11 @@ class DataFeed:
                 )
                 stream.subscribe_trade_updates(self.on_trade_update)
                 print("WebSocket trade_updates connected")
+                attempt = 0
                 await stream.run()
             except Exception as e:
                 delay = RECONNECT_DELAYS[min(attempt, len(RECONNECT_DELAYS) - 1)]
+                print(f"[ERROR] TradingStream crashed (attempt {attempt + 1}): {repr(e)}")
                 await asyncio.sleep(delay)
                 attempt += 1
 
