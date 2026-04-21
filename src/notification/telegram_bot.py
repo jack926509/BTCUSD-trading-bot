@@ -1,8 +1,22 @@
 import asyncio
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from telegram import Bot
 from telegram.constants import ParseMode
+
+
+def _pnl(v: float) -> str:
+    return f"+${v:,.0f}" if v >= 0 else f"−${abs(v):,.0f}"
+
+def _pct(diff: float, base: float) -> str:
+    if not base:
+        return ""
+    p = abs(diff / base * 100)
+    sign = "+" if diff >= 0 else "−"
+    return f"{sign}{p:.2f}%"
+
+def _now_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%m/%d %H:%M UTC")
 
 
 class TelegramNotifier:
@@ -11,10 +25,9 @@ class TelegramNotifier:
         self._chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
         self._bot     = Bot(token=self._token) if self._token else None
 
-        # 差異化心跳追蹤
-        self._last_float_pnl:      float  = 0.0
-        self._last_breaker_state:  str    = ""
-        self._state_changed_flags: set    = set()
+        self._last_float_pnl:      float = 0.0
+        self._last_breaker_state:  str   = ""
+        self._state_changed_flags: set   = set()
 
     async def _send(self, text: str):
         if not self._bot or not self._chat_id:
@@ -22,37 +35,40 @@ class TelegramNotifier:
             return
         try:
             await self._bot.send_message(
-                chat_id=self._chat_id,
-                text=text,
-                parse_mode=ParseMode.MARKDOWN,
+                chat_id    = self._chat_id,
+                text       = text,
+                parse_mode = ParseMode.HTML,
             )
         except Exception as e:
             print(f"[TG] send error: {e}")
 
     async def alert(self, message: str, level: str = "INFO"):
-        prefix = {"CRITICAL": "🔴", "WARNING": "⚠️", "INFO": "ℹ️"}.get(level, "")
-        await self._send(f"{prefix} {message}")
+        icons = {"CRITICAL": "🔴", "WARNING": "⚠️", "INFO": "ℹ️"}
+        icon  = icons.get(level, "")
+        # 純文字 alert 不用 HTML tag，直接送
+        await self._send(f"{icon} {message}")
 
     # ── Startup ──────────────────────────────────────────────────────────────
 
     async def notify_startup(self, circuit_state, mode: str = "PAPER"):
         state_val = circuit_state.value if hasattr(circuit_state, "value") else str(circuit_state)
-        db_path   = os.getenv("DB_PATH", "/app/data/trading.db")
-        volume_ok = "✅" if os.path.dirname(db_path) else "❌"
+        mode_icon = "🧪" if mode == "PAPER" else "🔴"
+        cb_icon   = {"CLOSED": "🟢", "HALF": "🟡", "OPEN": "🔴"}.get(state_val, "⚪")
         text = (
-            f"🟢 *Trading System v7.0 啟動*\n"
-            f"模式：{mode}（{'Paper Trading' if mode == 'PAPER' else 'Live Trading'}）\n"
-            f"熔斷器：{state_val}（連虧：0）\n"
-            f"Volume：{os.path.dirname(db_path)} {volume_ok}\n"
-            f"trade\\_updates WS：已連線 ✅"
+            f"🚀 <b>Trading System v7.0 啟動</b>\n"
+            f"{'─' * 22}\n"
+            f"{mode_icon} 模式　<b>{mode}</b>\n"
+            f"{cb_icon} 熔斷器　{state_val}\n"
+            f"📡 WebSocket　連線中…\n"
+            f"⏰ {_now_utc()}"
         )
         await self._send(text)
 
-    # ── Trade Events ─────────────────────────────────────────────────────────
+    # ── Trade Open ────────────────────────────────────────────────────────────
 
     async def notify_trade_open(self, symbol: str, signal, description: str = ""):
         direction = getattr(signal, "direction", "?")
-        side_str  = "LONG" if direction == "BUY" else "SHORT"
+        side_str  = "LONG 🔺" if direction == "BUY" else "SHORT 🔻"
         entry     = getattr(signal, "entry_limit_price", 0) or 0
         sl        = getattr(signal, "stop_loss", 0) or 0
         hard_sl   = getattr(signal, "hard_sl_price", 0) or 0
@@ -62,96 +78,116 @@ class TelegramNotifier:
         rrr       = getattr(signal, "rrr", 0) or 0
         htf_bias  = getattr(signal, "htf_bias", "N/A")
         source    = getattr(signal, "source", "N/A")
-        disp      = getattr(signal, "displacement_bars", None)
-        conditions= getattr(signal, "conditions_met", [])
+        ob_level  = getattr(signal, "ob_level", None)
+        fvg_range = getattr(signal, "fvg_range", None)
 
-        sl_diff   = entry - sl if direction == "BUY" else sl - entry
-        tp1_diff  = tp1 - entry if direction == "BUY" else entry - tp1
-        tp2_diff  = tp2 - entry if direction == "BUY" else entry - tp2
+        risk_usd  = abs(entry - sl)
+        tp1_usd   = abs(tp1 - entry)
+        tp2_usd   = abs(tp2 - entry)
 
-        source_line = f"訊號類型：{source}"
-        if source == "CHOCH" and disp:
-            source_line += f"（位移確認 {disp} 根）"
+        bias_icon = "🟢" if htf_bias == "BULLISH" else ("🔴" if htf_bias == "BEARISH" else "⚪")
+        src_map   = {"BOS": "BOS 突破", "CHOCH": "CHoCH 轉折", "SWEEP": "流動性掃盪"}
+        src_label = src_map.get(source, source)
 
-        cond_count = len(conditions)
-        cond_total = cond_count  # 實際條件數
+        zone_line = ""
+        if ob_level:
+            zone_line += f"📦 OB　${ob_level:,.0f}\n"
+        if fvg_range:
+            zone_line += f"🕳  FVG　{fvg_range}\n"
 
         text = (
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📈 *開倉*  {symbol} {side_str}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"進場限價：${entry:,.0f}（OB 回踩）\n"
-            f"止損：${sl:,.0f}  (−${abs(sl_diff):,.0f})\n"
-            f"Hard SL：${hard_sl:,.0f}（盤中觸發點）\n"
-            f"目標①：${tp1:,.0f}  (+${tp1_diff:,.0f})\n"
-            f"目標②：${tp2:,.0f}  (+${tp2_diff:,.0f})\n"
-            f"失效條件：收盤跌破 ${inval:,.0f}\n"
-            f"RRR：1:{rrr:.2f}\n"
-            f"HTF 偏向：{htf_bias}\n"
-            f"結構：{description}\n"
-            f"{source_line}\n"
-            f"條件確認：{cond_count}/{cond_total}"
+            f"📊 <b>開倉 · {symbol} {side_str}</b>\n"
+            f"{'─' * 24}\n"
+            f"⏰ {_now_utc()}\n"
+            f"{bias_icon} HTF　{htf_bias}　｜　{src_label}\n"
+            f"{'─' * 24}\n"
+            f"💰 進場限價　<b>${entry:,.0f}</b>\n"
+            f"🎯 TP1　${tp1:,.0f}　<i>({_pct(tp1_usd, entry)}  +${tp1_usd:,.0f})</i>\n"
+            f"🏁 TP2　${tp2:,.0f}　<i>({_pct(tp2_usd, entry)}  +${tp2_usd:,.0f})</i>\n"
+            f"🔻 SL　${sl:,.0f}　<i>({_pct(-risk_usd, entry)}  −${risk_usd:,.0f})</i>\n"
+            f"⚡ Hard SL　${hard_sl:,.0f}　<i>盤中觸發</i>\n"
+            f"{'─' * 24}\n"
+            f"📐 RRR　1 : {rrr:.2f}　｜　風險 ${risk_usd:,.0f}\n"
+            f"🔒 失效　收盤穿越 ${inval:,.0f}\n"
+            + (f"{'─' * 24}\n{zone_line}" if zone_line else "")
+            + (f"<i>{description}</i>" if description else "")
         )
         await self._send(text)
+
+    # ── TP1 ───────────────────────────────────────────────────────────────────
 
     async def notify_tp1(self, symbol: str, pos, realized_pnl: float):
-        """TP1 達成，含剩餘持倉快照"""
-        side_str = "LONG" if pos.side == "BUY" else "SHORT"
+        side_str = "LONG 🔺" if pos.side == "BUY" else "SHORT 🔻"
+        tp2      = getattr(pos, "take_profit_2", 0) or 0
+        realized = getattr(pos, "realized_pnl", realized_pnl) or realized_pnl
         text = (
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"✅ *TP1 達成*  {symbol} {side_str}（已平 50%）\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"實現：+${realized_pnl:,.0f}\n"
-            f"─ 剩餘持倉 ─\n"
-            f"止損已移至：${pos.entry_price:,.0f}（成本，已鎖利）\n"
-            f"目標②：${getattr(pos, 'take_profit_2', 0):,.0f}\n"
-            f"Trailing：啟動（跟蹤 M15 Swing Low，Pivot 3 根）"
+            f"✅ <b>TP1 達成 · {symbol} {side_str}</b>\n"
+            f"{'─' * 24}\n"
+            f"💵 本次實現　<b>+${realized_pnl:,.0f}</b>\n"
+            f"📦 已平倉 50%，剩餘 50% 持倉中\n"
+            f"{'─' * 24}\n"
+            f"🔒 止損移至　<b>${pos.entry_price:,.0f}</b>（成本，已鎖利）\n"
+            f"🏁 追蹤目標　${tp2:,.0f}\n"
+            f"📈 Trailing SL 啟動（M15 Swing Pivot 3 根確認）\n"
+            f"⏰ {_now_utc()}"
         )
         await self._send(text)
 
+    # ── Close ─────────────────────────────────────────────────────────────────
+
     async def notify_close(self, pos, reason: str, extra: str = ""):
-        side_str = "LONG" if pos.side == "BUY" else "SHORT"
+        side_str = "LONG 🔺" if pos.side == "BUY" else "SHORT 🔻"
         symbol   = getattr(pos, "symbol", "BTC/USD")
+        pnl      = getattr(pos, "last_pnl", 0) or 0
+        realized = getattr(pos, "realized_pnl", 0) or 0
+        total    = pnl + realized
 
-        reason_icons = {
-            "HARD_SL":     "⚡ *Hard SL 出場*",
-            "INVALIDATED": "🔄 *INVALIDATED 出場*",
-            "TRAILING_SL": "📉 *Trailing SL 出場*",
-            "SL":          "🛑 *止損出場*",
-            "TP":          "🎯 *TP 達成*",
-            "HTF_FLIP":    "🔀 *HTF 翻轉出場*",
+        headers = {
+            "HARD_SL":     ("⚡", "Hard SL 出場"),
+            "INVALIDATED": ("🔄", "結構失效出場"),
+            "TRAILING_SL": ("📉", "Trailing SL 出場"),
+            "HTF_FLIP":    ("🔀", "HTF 偏向翻轉出場"),
+            "TP2":         ("🏆", "TP2 全倉出場"),
+            "SL":          ("🛑", "止損出場"),
         }
-        header = reason_icons.get(reason, f"🚪 *出場* ({reason})")
+        icon, label = headers.get(reason, ("🚪", f"出場 ({reason})"))
 
-        entry_price = getattr(pos, "entry_price", 0) or 0
-        pnl         = getattr(pos, "last_pnl", 0) or 0
+        pnl_icon = "🟢" if pnl >= 0 else "🔴"
+        tot_icon = "🟢" if total >= 0 else "🔴"
 
-        if reason == "HARD_SL":
-            text = (
-                f"━━━━━━━━━━━━━━━━━━━━━\n"
-                f"{header}  {symbol} {side_str}\n"
-                f"━━━━━━━━━━━━━━━━━━━━━\n"
-                f"{extra}\n"
-                f"說明：盤中插針觸發 Hard SL（未等收盤確認）"
-            )
-        else:
-            pnl_str = f"+${pnl:,.0f}" if pnl >= 0 else f"−${abs(pnl):,.0f}"
-            text = (
-                f"━━━━━━━━━━━━━━━━━━━━━\n"
-                f"{header}  {symbol} {side_str}\n"
-                f"━━━━━━━━━━━━━━━━━━━━━\n"
-                f"出場損益：{pnl_str}\n"
-                f"原因：{reason}"
-                + (f"\n{extra}" if extra else "")
-            )
-        await self._send(text)
+        lines = [
+            f"{icon} <b>{label} · {symbol} {side_str}</b>",
+            f"{'─' * 24}",
+            f"💰 進場　${pos.entry_price:,.0f}",
+            f"{pnl_icon} 本次損益　<b>{_pnl(pnl)}</b>",
+        ]
+
+        if realized:
+            lines.append(f"{tot_icon} 本單合計　{_pnl(total)}  <i>(含 TP1 +${realized:,.0f})</i>")
+
+        if extra:
+            lines += [f"{'─' * 24}", extra]
+
+        lines.append(f"⏰ {_now_utc()}")
+        await self._send("\n".join(lines))
 
     # ── Circuit Breaker ───────────────────────────────────────────────────────
 
     async def notify_circuit_breaker(self, state: str, loss_streak: int):
-        icons = {"OPEN": "🔴", "HALF": "🟡", "CLOSED": "🟢"}
-        icon  = icons.get(state, "⚪")
-        text  = f"{icon} *熔斷器狀態變更*：{state}（連虧：{loss_streak}）"
+        icons   = {"OPEN": "🔴", "HALF": "🟡", "CLOSED": "🟢"}
+        descs   = {
+            "OPEN":   f"連虧 {loss_streak} 次，暫停交易 4 小時",
+            "HALF":   "暫停期滿，進入試單模式",
+            "CLOSED": "恢復正常交易",
+        }
+        icon = icons.get(state, "⚪")
+        text = (
+            f"{icon} <b>熔斷器變更 → {state}</b>\n"
+            f"{'─' * 24}\n"
+            f"{descs.get(state, '')}\n"
+            f"連虧計數：{loss_streak}\n"
+            f"⏰ {_now_utc()}"
+        )
         await self._send(text)
         self.mark_state_changed("BREAKER")
 
@@ -161,14 +197,11 @@ class TelegramNotifier:
         self._state_changed_flags.add(flag)
 
     def has_meaningful_state_change(self, snapshot: dict) -> bool:
-        """差異化心跳觸發條件"""
         if self._state_changed_flags:
             return True
-        float_pnl    = snapshot.get("float_pnl", 0.0)
-        breaker_state = snapshot.get("breaker_state", "")
-        if abs(float_pnl - self._last_float_pnl) >= 50:
+        if abs(snapshot.get("float_pnl", 0.0) - self._last_float_pnl) >= 50:
             return True
-        if breaker_state != self._last_breaker_state:
+        if snapshot.get("breaker_state", "") != self._last_breaker_state:
             return True
         return False
 
@@ -178,28 +211,42 @@ class TelegramNotifier:
         breaker_state = snapshot.get("breaker_state", "CLOSED")
         loss_streak   = snapshot.get("loss_streak", 0)
         position_info = snapshot.get("position_info", "無持倉")
+        daily_pnl     = snapshot.get("daily_pnl", 0.0)
 
-        self._last_float_pnl    = float_pnl
+        self._last_float_pnl     = float_pnl
         self._last_breaker_state = breaker_state
 
-        pnl_str = f"+${float_pnl:,.0f}" if float_pnl >= 0 else f"−${abs(float_pnl):,.0f}"
+        cb_icon   = {"CLOSED": "🟢", "HALF": "🟡", "OPEN": "🔴"}.get(breaker_state, "⚪")
+        has_pos   = position_info != "無持倉"
+        pnl_icon  = "🟢" if float_pnl >= 0 else "🔴"
+        day_icon  = "🟢" if daily_pnl >= 0 else "🔴"
+
+        pos_block = (
+            f"₿ {position_info}\n"
+            f"{pnl_icon} 浮動損益　<b>{_pnl(float_pnl)}</b>\n"
+        ) if has_pos else "💤 無持倉\n"
+
         text = (
-            f"💓 *心跳*  {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC\n"
-            f"持倉：{position_info}\n"
-            f"浮動損益：{pnl_str}\n"
-            f"熔斷器：{breaker_state}（連虧：{loss_streak}）"
+            f"💓 <b>系統心跳</b>  {_now_utc()}\n"
+            f"{'─' * 24}\n"
+            f"{pos_block}"
+            f"{'─' * 24}\n"
+            f"{cb_icon} 熔斷器　{breaker_state}　連虧 {loss_streak}\n"
+            f"{day_icon} 今日損益　{_pnl(daily_pnl)}"
         )
         await self._send(text)
 
     # ── WebSocket Disconnect ──────────────────────────────────────────────────
 
     async def notify_ws_disconnect(self, attempt: int, delay: int, pos_snapshot: str = ""):
-        dashboard_url = os.getenv("ALPACA_DASHBOARD_URL", "")
         text = (
-            f"🚨 *WebSocket 斷線*\n"
-            f"持倉中！正在重連...（第 {attempt} 次，{delay}s 後）\n"
+            f"🚨 <b>WebSocket 斷線（第 {attempt} 次）</b>\n"
+            f"{'─' * 24}\n"
+            f"⏳ {delay}s 後重連…\n"
         )
-        if pos_snapshot:
-            text += f"─ 持倉快照 ─\n{pos_snapshot}\n"
-        text += f"─ 緊急操作 ─\n{dashboard_url}"
+        if pos_snapshot and pos_snapshot != "無持倉":
+            text += f"{'─' * 24}\n📍 持倉快照\n{pos_snapshot}\n"
+        dashboard = os.getenv("ALPACA_DASHBOARD_URL", "")
+        if dashboard:
+            text += f"{'─' * 24}\n🔗 {dashboard}"
         await self._send(text)

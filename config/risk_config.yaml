@@ -28,5 +28,5 @@ server_side_stop:
   enabled: true
   buffer_pct: 0.005
 
-# Paper Testing 階段維持 false；確認策略品質後改 true
-auto_trade: false
+# 設為 true 啟用自動下單；Paper 模式下仍受 ALPACA_PAPER_MODE 保護
+auto_trade: true

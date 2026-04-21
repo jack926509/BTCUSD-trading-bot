@@ -119,8 +119,16 @@ class TradingSystem:
         try:
             account = self.executor.client.get_account()
             equity  = float(account.equity)
+            buying  = float(account.buying_power)
             self.risk.set_equity(equity)
-            print(f"[BOOT] Account equity: ${equity:,.2f}")
+            auto_on = self.risk.is_auto_trade_enabled()
+            print(
+                f"[BOOT] Alpaca account: equity=${equity:,.2f}  "
+                f"buying_power=${buying:,.2f}  "
+                f"auto_trade={'ON' if auto_on else 'OFF'}"
+            )
+            if not auto_on:
+                print("[BOOT] WARNING: auto_trade=false — signals will NOT place orders")
         except Exception as e:
             print(f"[WARN] 無法取得帳戶淨值：{e}，使用最低名目金額")
 

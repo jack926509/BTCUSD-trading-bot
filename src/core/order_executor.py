@@ -75,19 +75,19 @@ class OrderExecutor:
         if stop_price:
             req = StopLimitOrderRequest(
                 symbol        = "BTC/USD",
-                notional      = str(round(notional, 2)),
+                notional      = round(notional, 2),
                 side          = OrderSide.BUY if side == "BUY" else OrderSide.SELL,
                 time_in_force = TimeInForce.GTC,
-                stop_price    = str(round(stop_price, 2)),
-                limit_price   = str(round(limit_price, 2)),
+                stop_price    = round(stop_price, 2),
+                limit_price   = round(limit_price, 2),
             )
         else:
             req = LimitOrderRequest(
                 symbol        = "BTC/USD",
-                notional      = str(round(notional, 2)),
+                notional      = round(notional, 2),
                 side          = OrderSide.BUY if side == "BUY" else OrderSide.SELL,
                 time_in_force = TimeInForce.GTC,
-                limit_price   = str(round(limit_price, 2)),
+                limit_price   = round(limit_price, 2),
             )
 
         # FIX P0-3: 在迴圈外初始化，避免 submit_order 失敗時 except 裡出現 NameError
@@ -122,9 +122,9 @@ class OrderExecutor:
         close_side = OrderSide.SELL if pos_side == "BUY" else OrderSide.BUY
         req = MarketOrderRequest(
             symbol        = "BTC/USD",
-            qty           = str(round(qty, 8)),
+            qty           = round(qty, 8),
             side          = close_side,
-            time_in_force = TimeInForce.GTC,
+            time_in_force = TimeInForce.IOC,
         )
         order = None
         for attempt in range(3):
@@ -217,10 +217,10 @@ class OrderExecutor:
 
         req = StopOrderRequest(
             symbol        = "BTC/USD",
-            qty           = str(round(qty, 8)),
+            qty           = round(qty, 8),
             side          = stop_side,
             time_in_force = TimeInForce.GTC,
-            stop_price    = str(stop_price),
+            stop_price    = stop_price,
         )
         try:
             order = self.client.submit_order(req)
