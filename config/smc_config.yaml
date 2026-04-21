@@ -1,0 +1,85 @@
+version: "7.0"
+
+timeframes:
+  htf: "H4"
+  mtf: "H1"
+  ltf: "M15"
+
+htf_bars: 200
+ltf_bars: 100
+
+structure:
+  bos:
+    min_swing_bars: 5
+  choch:
+    require_displacement: true
+    displacement_min_candles: 2
+
+liquidity:
+  order_block:
+    enabled: true
+    max_age_bars: 30
+    min_body_ratio: 0.6
+    mitigation_type: close
+    wick_penetration_threshold: 0.7
+  fair_value_gap:
+    enabled: true
+    min_gap_usd: 50
+    partial_fill_threshold: 0.5
+  equal_highs_lows:
+    enabled: true
+    tolerance_usd: 150
+  breaker_block:
+    enabled: true
+  sweep:
+    enabled: true
+    wick_ratio: 2.0
+    require_htf_alignment: true
+
+entry:
+  require_htf_alignment: true
+
+  bos_entry_model: ob_fvg
+  choch_entry_model: fvg_only
+  sweep_entry_model: ob_fvg
+
+  premium_discount:
+    enabled: true
+    range_source: htf
+    strong_trend_relax_bars: 8
+
+  session_filter:
+    enabled: true
+    no_entry_sessions:
+      - name: "Asia_Low_Liquidity"
+        utc_start: "20:00"
+        utc_end:   "01:00"
+      - name: "Pre_London_Watch"
+        utc_start: "05:00"
+        utc_end:   "07:00"
+        mode: "require_displacement"
+    session_open_cooldown_bars: 1
+    affect_open_positions: false
+
+signal_logic:
+  ltf_trigger_alignment: strict
+
+ai:
+  model: "claude-haiku-4-5-20251001"
+  max_tokens: 600
+  timeout_seconds: 10
+  role: "describer"
+  forbidden_elements:
+    - "DXY"
+    - "VIX"
+    - "非農"
+    - "聯準會"
+    - "利率"
+    - "通膨"
+    - "CPI"
+    - "ETF 申購"
+    - "鏈上數據"
+    - "新聞"
+    - "財報"
+    - "信心"
+    - "勝率"

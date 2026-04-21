@@ -1,0 +1,26 @@
+partial_tp:
+  enabled: true
+  tp1_close_pct: 0.5
+  move_sl_to_entry: true
+
+trailing_stop:
+  enabled: true
+  activate_after: tp1
+  mode: structural
+  structural_buffer_usd: 50
+  min_trail_pct: 0.003
+  fallback_trail_pct: 0.015
+  trailing_pivot_bars: 3
+
+invalidation:
+  enabled: true
+  check_on: candle_close
+
+max_hold:
+  enabled: true
+  hours: 72
+  force_close_condition: "overtime_and_losing"
+  unrealized_pnl_threshold: 0.0
+
+server_side_stop:
+  auto_cancel_on_close: true

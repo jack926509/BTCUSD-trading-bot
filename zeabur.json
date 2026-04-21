@@ -1,0 +1,8 @@
+{
+  "build": {
+    "command": "pip install -r requirements.txt && python init_db.py"
+  },
+  "start": {
+    "command": "python main.py"
+  }
+}
