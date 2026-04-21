@@ -1,5 +1,6 @@
 import os
 import yaml
+from datetime import date, datetime, timezone
 
 
 class RiskManager:
@@ -11,8 +12,27 @@ class RiskManager:
 
         self._account_equity = None
 
+        # Daily loss tracking
+        self._daily_pnl:  float = 0.0
+        self._daily_date: date  = datetime.now(timezone.utc).date()
+
     def set_equity(self, equity: float):
         self._account_equity = equity
+
+    def record_trade_pnl(self, pnl: float):
+        """每次出場後呼叫，追蹤當日累計 PnL"""
+        today = datetime.now(timezone.utc).date()
+        if self._daily_date != today:
+            self._daily_pnl  = 0.0
+            self._daily_date = today
+        self._daily_pnl += pnl
+
+    def is_daily_loss_exceeded(self) -> bool:
+        """當日虧損超過 max_daily_loss_pct × equity 時返回 True"""
+        if self._account_equity is None or self._account_equity <= 0:
+            return False
+        max_pct = self._cfg.get("account", {}).get("max_daily_loss_pct", 0.02)
+        return self._daily_pnl < -(self._account_equity * max_pct)
 
     def calc_notional(self, signal) -> float:
         """
@@ -46,6 +66,9 @@ class RiskManager:
 
     def is_auto_trade_enabled(self) -> bool:
         return self._cfg.get("auto_trade", False)
+
+    def get_min_rrr(self) -> float:
+        return self._cfg.get("position", {}).get("min_rrr", 1.5)
 
     def get_hard_sl_buffer(self) -> float:
         return self._cfg.get("hard_sl", {}).get("buffer_pct", 0.003)

@@ -1,7 +1,11 @@
 import aiosqlite
 import asyncio
 import os
-from datetime import datetime
+from datetime import datetime, timezone
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 class Database:
@@ -57,7 +61,7 @@ class Database:
                 state,
                 loss_streak,
                 opened_at.isoformat() if opened_at else None,
-                datetime.utcnow().isoformat(),
+                _now(),
             ),
         )
 
@@ -71,7 +75,7 @@ class Database:
             """INSERT OR IGNORE INTO pending_orders
                (order_id, side, notional_usd, submitted_at)
                VALUES (?, ?, ?, ?)""",
-            (order_id, side, notional, datetime.utcnow().isoformat()),
+            (order_id, side, notional, _now()),
         )
 
     async def get_unconfirmed_orders(self) -> list:
@@ -83,7 +87,7 @@ class Database:
     async def confirm_order_filled(self, order_id: str):
         await self._execute(
             "UPDATE pending_orders SET confirmed=1, confirmed_at=? WHERE order_id=?",
-            (datetime.utcnow().isoformat(), order_id),
+            (_now(), order_id),
         )
 
     # ── Analysis Log ─────────────────────────────────────────────────────────
@@ -98,7 +102,7 @@ class Database:
                     structure_description, price_at_signal, config_version)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    datetime.utcnow().isoformat(),
+                    _now(),
                     symbol,
                     getattr(signal, "timeframe", "M15"),
                     getattr(signal, "direction", "HOLD"),
@@ -164,7 +168,7 @@ class Database:
                     hard_sl_price,
                     server_stop_order_id,
                     take_profit,
-                    datetime.utcnow().isoformat(),
+                    _now(),
                 ),
             )
             await self._conn.commit()
@@ -183,7 +187,7 @@ class Database:
                SET close_time=?, close_price=?, pnl_usd=?, close_reason=?, broker_order_id=?
                WHERE id=?""",
             (
-                datetime.utcnow().isoformat(),
+                _now(),
                 close_price,
                 pnl_usd,
                 close_reason,
@@ -217,5 +221,5 @@ class Database:
     async def log_event(self, event_type: str, message: str):
         await self._execute(
             "INSERT INTO system_log (timestamp, event_type, message) VALUES (?, ?, ?)",
-            (datetime.utcnow().isoformat(), event_type, message),
+            (_now(), event_type, message),
         )

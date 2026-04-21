@@ -1,6 +1,6 @@
 import asyncio
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 
 
@@ -30,14 +30,18 @@ class CircuitBreaker:
             opened_at_str    = row.get("opened_at")
             if opened_at_str:
                 try:
-                    self.opened_at = datetime.fromisoformat(opened_at_str)
+                    dt = datetime.fromisoformat(opened_at_str)
+                    # 確保時區一致性
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    self.opened_at = dt
                 except ValueError:
                     self.opened_at = None
             else:
                 self.opened_at = None
 
             if self.state == BreakerState.OPEN and self.opened_at:
-                elapsed_h = (datetime.utcnow() - self.opened_at).total_seconds() / 3600
+                elapsed_h = (datetime.now(timezone.utc) - self.opened_at).total_seconds() / 3600
                 if elapsed_h >= self.pause_hours:
                     self.state = BreakerState.HALF
                     await self._persist(db)
@@ -59,13 +63,13 @@ class CircuitBreaker:
         if close_reason in ("SL", "INVALIDATED", "TRAILING_SL", "HARD_SL"):
             if self.state == BreakerState.HALF:
                 self.state       = BreakerState.OPEN
-                self.opened_at   = datetime.utcnow()
+                self.opened_at   = datetime.now(timezone.utc)
                 self.loss_streak = 1
             else:
                 self.loss_streak += 1
                 if self.loss_streak >= self.max_losses:
                     self.state     = BreakerState.OPEN
-                    self.opened_at = datetime.utcnow()
+                    self.opened_at = datetime.now(timezone.utc)
         else:
             self.loss_streak = 0
             if self.state == BreakerState.HALF:

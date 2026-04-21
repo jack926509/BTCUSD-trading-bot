@@ -7,6 +7,7 @@ position:
   risk_per_trade_pct: 0.01
   max_concurrent_trades: 1
   max_single_symbol_pct: 0.10
+  min_rrr: 1.5
 
 btcusd:
   min_notional_usd: 1

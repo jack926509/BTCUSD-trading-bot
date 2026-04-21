@@ -32,7 +32,6 @@ class TradingSystem:
         self.smc     = SMCEngine()
         self.risk    = RiskManager()
 
-        # FIX P0-1/P0-2: 將 circuit 注入 PositionManager，讓各 close 路徑可直接呼叫
         self.position_mgr = PositionManager(
             on_close = self._on_position_close,
             db       = self.db,
@@ -40,10 +39,12 @@ class TradingSystem:
             smc      = self.smc,
             circuit  = self.circuit,
         )
+        # T-1 FIX: 將 limit_order_timeout 從 risk_config 傳入 OrderExecutor
         self.executor = OrderExecutor(
-            position_mgr = self.position_mgr,
-            db           = self.db,
-            tg           = self.tg,
+            position_mgr        = self.position_mgr,
+            db                  = self.db,
+            tg                  = self.tg,
+            limit_order_timeout = self.risk.get_limit_order_timeout(),
         )
         self.position_mgr.executor = self.executor
 
@@ -57,7 +58,6 @@ class TradingSystem:
             sys.exit(1)
 
         self.claude   = ClaudeClient(config=smc_cfg)
-        # FIX P2-1: 傳入 tg，讓佇列滿時可推播告警
         self.ai_queue = AnalysisQueue(max_size=50, tg=self.tg)
 
         self.candle_builder = CandleBuilder(
@@ -80,15 +80,12 @@ class TradingSystem:
         print("Trading System v7.0 starting...")
 
         await self._check_volume()
-
-        # FIX P2-3: DB 連線加重試
         await self._connect_db_with_retry()
 
         await self.circuit.load_state(self.db)
         self.circuit.db = self.db
         self.circuit.tg = self.tg
 
-        # FIX P1-5: 啟動時從 Alpaca 取得帳戶淨值
         await self._refresh_equity()
 
         await self.executor.scan_orphan_orders_on_startup()
@@ -101,7 +98,7 @@ class TradingSystem:
         await self._seed_historical_bars()
 
     async def _connect_db_with_retry(self, max_attempts: int = 5):
-        """FIX P2-3: DB 連線失敗時指數退避重試"""
+        """DB 連線失敗時指數退避重試"""
         for attempt in range(max_attempts):
             try:
                 await self.db.connect()
@@ -118,7 +115,7 @@ class TradingSystem:
                 await asyncio.sleep(wait)
 
     async def _refresh_equity(self):
-        """FIX P1-5: 取得 Alpaca 帳戶淨值並注入 RiskManager"""
+        """取得 Alpaca 帳戶淨值並注入 RiskManager"""
         try:
             account = self.executor.client.get_account()
             equity  = float(account.equity)
@@ -242,6 +239,18 @@ class TradingSystem:
         if self.circuit.is_open():
             return
 
+        # B-3 FIX: 每日損失超限時暫停下單
+        if self.risk.is_daily_loss_exceeded():
+            await self.tg.alert(
+                "🔴 每日最大虧損上限已觸及，今日暫停新倉", level="WARNING"
+            )
+            return
+
+        # T-8 FIX: RRR 最低門檻過濾
+        signal = ctx.get_signal()
+        if signal.rrr < self.risk.get_min_rrr():
+            return
+
         await self.ai_queue.enqueue(symbol, ctx)
 
     # ── AI Queue Handler ──────────────────────────────────────────────────────
@@ -258,7 +267,7 @@ class TradingSystem:
                 pass
             return
 
-        # FIX P1-5: 每次下單前刷新淨值
+        # 每次下單前刷新淨值
         await self._refresh_equity()
 
         notional    = self.risk.calc_notional(job.signal)
@@ -308,15 +317,19 @@ class TradingSystem:
 
     async def _on_position_close(self, pos, reason):
         """
-        此 callback 僅在 PositionManager 未自行處理的出場原因（如 SL、TP）時呼叫。
-        HARD_SL / INVALIDATED / HTF_FLIP / TRAILING_SL 已在 PositionManager 直接處理。
+        PositionManager 直接處理所有出場路徑（HARD_SL / INVALIDATED / HTF_FLIP /
+        TRAILING_SL / TP2），此 callback 僅作為保底路徑。
+        出場後更新每日 PnL 追蹤。
         """
-        if reason in ("INVALIDATED", "HARD_SL", "HTF_FLIP", "TRAILING_SL"):
+        if reason in ("INVALIDATED", "HARD_SL", "HTF_FLIP", "TRAILING_SL", "TP2"):
+            # 已在 PositionManager 完整處理，更新每日 PnL 即可
+            self.risk.record_trade_pnl(pos.last_pnl)
             return
         await self.executor.close_position(pos)
         self.circuit.record(reason)
         await self.db.close_position(pos, reason)
         await self.tg.notify_close(pos, reason)
+        self.risk.record_trade_pnl(pos.last_pnl)
 
     # ── Heartbeat Loop ────────────────────────────────────────────────────────
 
@@ -349,12 +362,13 @@ class TradingSystem:
             "breaker_state": self.circuit.state.value,
             "loss_streak":   self.circuit.loss_streak,
             "position_info": pos_info,
+            "daily_pnl":     self.risk._daily_pnl,
         }
 
     # ── Graceful Shutdown ─────────────────────────────────────────────────────
 
     def _setup_signal_handlers(self):
-        """FIX P2-9: 攔截 SIGTERM / SIGINT，優雅關閉並持久化熔斷器狀態"""
+        """攔截 SIGTERM / SIGINT，優雅關閉並持久化熔斷器狀態"""
         loop = asyncio.get_event_loop()
 
         def _handle_shutdown(sig_name):
@@ -369,7 +383,6 @@ class TradingSystem:
 
     async def _graceful_shutdown(self):
         await self.tg.alert("🔴 Trading System 正在關閉（SIGTERM）", level="WARNING")
-        # 確保熔斷器狀態寫入 DB
         try:
             await self.circuit._persist(self.db)
         except Exception:

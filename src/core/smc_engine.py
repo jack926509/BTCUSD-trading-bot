@@ -2,6 +2,7 @@ import os
 import yaml
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Optional
 
 
@@ -60,8 +61,9 @@ class SMCEngine:
         self._htf_bias_flipped: dict = {}
 
         # Structure state
-        self._swing_highs: dict = defaultdict(lambda: defaultdict(list))
-        self._swing_lows:  dict = defaultdict(lambda: defaultdict(list))
+        # B-4: 改用 deque(maxlen=50)，避免 list.pop(0) O(n) 操作
+        self._swing_highs: dict = defaultdict(lambda: defaultdict(lambda: deque(maxlen=50)))
+        self._swing_lows:  dict = defaultdict(lambda: defaultdict(lambda: deque(maxlen=50)))
         self._order_blocks: dict = defaultdict(lambda: defaultdict(list))
         self._fvgs:         dict = defaultdict(lambda: defaultdict(list))
         self._eqh_eql:      dict = defaultdict(lambda: defaultdict(list))
@@ -77,6 +79,7 @@ class SMCEngine:
 
         fvg_cfg                  = self._cfg.get("liquidity", {}).get("fair_value_gap", {})
         self.fvg_min_gap         = fvg_cfg.get("min_gap_usd", 50)
+        self.fvg_partial_fill    = fvg_cfg.get("partial_fill_threshold", 0.5)
 
         eql_cfg                  = self._cfg.get("liquidity", {}).get("equal_highs_lows", {})
         self.eql_tolerance       = eql_cfg.get("tolerance_usd", 150)
@@ -92,7 +95,6 @@ class SMCEngine:
         self.choch_entry_model   = entry_cfg.get("choch_entry_model", "fvg_only")
         self.sweep_entry_model   = entry_cfg.get("sweep_entry_model", "ob_fvg")
 
-        hard_sl_cfg              = {}  # loaded from risk_config in position_manager
         self._hard_sl_buffer     = 0.003
 
     # ── Public API ───────────────────────────────────────────────────────────
@@ -140,24 +142,41 @@ class SMCEngine:
     # ── HTF Bias ─────────────────────────────────────────────────────────────
 
     def _update_htf_bias(self, symbol: str):
+        """
+        T-2 FIX: 比較確認的 Swing Point，而非單根棒的原始高低點。
+        HH + HL = BULLISH；LH + LL = BEARISH；否則保持前值。
+        """
         bars = list(self._bars[symbol][self.htf])
         if len(bars) < 10:
             self._htf_bias[symbol] = "NEUTRAL"
             return
 
-        highs = [b["high"] for b in bars[-20:]]
-        lows  = [b["low"]  for b in bars[-20:]]
+        n = 3  # HTF swing 確認左右各 3 根
+        swing_highs = []
+        swing_lows  = []
 
-        hh = highs[-1] > max(highs[:-1])
-        hl = lows[-1]  > min(lows[:-1])
-        lh = highs[-1] < max(highs[:-1])
-        ll = lows[-1]  < min(lows[:-1])
+        for i in range(n, len(bars) - n):
+            pivot = bars[i]
+            left  = bars[i - n:i]
+            right = bars[i + 1:i + n + 1]
+            if all(pivot["high"] > b["high"] for b in left + right):
+                swing_highs.append(pivot["high"])
+            if all(pivot["low"] < b["low"] for b in left + right):
+                swing_lows.append(pivot["low"])
+
+        if len(swing_highs) < 2 or len(swing_lows) < 2:
+            return  # 資料不足，保持前值
+
+        hh = swing_highs[-1] > swing_highs[-2]  # Higher High
+        hl = swing_lows[-1]  > swing_lows[-2]   # Higher Low
+        lh = swing_highs[-1] < swing_highs[-2]  # Lower High
+        ll = swing_lows[-1]  < swing_lows[-2]   # Lower Low
 
         if hh and hl:
             self._htf_bias[symbol] = "BULLISH"
         elif lh and ll:
             self._htf_bias[symbol] = "BEARISH"
-        # else keep previous
+        # else: 結構不明確，保持前值
 
     # ── Structure Update ─────────────────────────────────────────────────────
 
@@ -180,13 +199,9 @@ class SMCEngine:
 
         if all(pivot["high"] > b["high"] for b in left + right):
             self._swing_highs[symbol][tf].append(pivot["high"])
-            if len(self._swing_highs[symbol][tf]) > 50:
-                self._swing_highs[symbol][tf].pop(0)
 
         if all(pivot["low"] < b["low"] for b in left + right):
             self._swing_lows[symbol][tf].append(pivot["low"])
-            if len(self._swing_lows[symbol][tf]) > 50:
-                self._swing_lows[symbol][tf].pop(0)
 
     def _detect_order_blocks(self, symbol: str, tf: str, bars: list):
         if len(bars) < 3:
@@ -243,23 +258,39 @@ class SMCEngine:
         if not cfg.get("enabled", True):
             return
 
+        # T-5 FIX: 標記現有 FVG 是否已被填補
+        curr = bars[-1]
+        for fvg in self._fvgs[symbol][tf]:
+            if fvg["filled"]:
+                continue
+            gap_size = fvg["high"] - fvg["low"]
+            if gap_size <= 0:
+                continue
+            if fvg["type"] == "BULLISH":
+                # 價格進入 FVG 達 partial_fill_threshold 比例
+                if curr["low"] <= fvg["low"] + gap_size * self.fvg_partial_fill:
+                    fvg["filled"] = True
+            elif fvg["type"] == "BEARISH":
+                if curr["high"] >= fvg["high"] - gap_size * self.fvg_partial_fill:
+                    fvg["filled"] = True
+
         bar1, _, bar3 = bars[-3], bars[-2], bars[-1]
 
         # Bullish FVG: bar1.high < bar3.low
         if bar3["low"] - bar1["high"] >= self.fvg_min_gap:
             self._fvgs[symbol][tf].append({
-                "type": "BULLISH",
-                "high": bar3["low"],
-                "low":  bar1["high"],
+                "type":   "BULLISH",
+                "high":   bar3["low"],
+                "low":    bar1["high"],
                 "filled": False,
             })
 
         # Bearish FVG: bar3.high < bar1.low
         if bar1["low"] - bar3["high"] >= self.fvg_min_gap:
             self._fvgs[symbol][tf].append({
-                "type": "BEARISH",
-                "high": bar1["low"],
-                "low":  bar3["high"],
+                "type":   "BEARISH",
+                "high":   bar1["low"],
+                "low":    bar3["high"],
                 "filled": False,
             })
 
@@ -292,9 +323,58 @@ class SMCEngine:
 
         self._eqh_eql[symbol][tf] = levels
 
+    # ── Session Filter ────────────────────────────────────────────────────────
+
+    def _is_no_entry_session(self, ts) -> bool:
+        """
+        T-6 FIX: 實作 Session Filter。
+        Asia_Low_Liquidity (20:00–01:00 UTC) 封鎖進場；
+        Pre_London_Watch (05:00–07:00 UTC) 需有位移確認。
+        """
+        session_cfg = self._cfg.get("entry", {}).get("session_filter", {})
+        if not session_cfg.get("enabled", False):
+            return False
+
+        no_entry_sessions = session_cfg.get("no_entry_sessions", [])
+        if not no_entry_sessions or ts is None:
+            return False
+
+        if hasattr(ts, "tzinfo") and ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+
+        hm = ts.hour * 60 + ts.minute
+
+        for session in no_entry_sessions:
+            mode = session.get("mode", "block")
+            if mode != "block":
+                continue  # require_displacement 由訊號位移過濾處理
+
+            try:
+                sh, sm = map(int, session["utc_start"].split(":"))
+                eh, em = map(int, session["utc_end"].split(":"))
+            except (KeyError, ValueError):
+                continue
+
+            start = sh * 60 + sm
+            end   = eh * 60 + em
+
+            if start <= end:
+                if start <= hm < end:
+                    return True
+            else:                   # 跨午夜（例如 20:00–01:00）
+                if hm >= start or hm < end:
+                    return True
+
+        return False
+
     # ── LTF Signal Evaluation ─────────────────────────────────────────────────
 
     def _evaluate_ltf_signal(self, symbol: str, candle: dict) -> SMCSignal:
+        # T-6 FIX: Session Filter
+        ts = candle.get("timestamp")
+        if self._is_no_entry_session(ts):
+            return SMCSignal(reject_reason="SESSION_FILTER")
+
         htf_bias = self._htf_bias.get(symbol, "NEUTRAL")
         if htf_bias == "NEUTRAL":
             return SMCSignal(reject_reason="NO_HTF_BIAS")
@@ -327,10 +407,9 @@ class SMCEngine:
         return self._build_structure_signal(symbol, candle, ltf_trigger, htf_bias, is_choch)
 
     def _detect_bos_choch(self, symbol: str, candle: dict) -> Optional[str]:
-        bars      = list(self._bars[symbol][self.ltf])
-        sh_list   = self._swing_highs[symbol][self.ltf]
-        sl_list   = self._swing_lows[symbol][self.ltf]
-        htf_bias  = self._htf_bias.get(symbol, "NEUTRAL")
+        sh_list  = self._swing_highs[symbol][self.ltf]
+        sl_list  = self._swing_lows[symbol][self.ltf]
+        htf_bias = self._htf_bias.get(symbol, "NEUTRAL")
 
         if not sh_list or not sl_list:
             return None
@@ -339,11 +418,13 @@ class SMCEngine:
         last_sl = sl_list[-1]
         close   = candle["close"]
 
-        # BOS: continuation of HTF bias
+        # T-7 FIX: BOS 也需要位移確認，避免假突破
         if htf_bias == "BULLISH" and close > last_sh:
-            return "BULLISH_BOS"
+            if self._has_displacement(symbol, self.ltf, "BULLISH"):
+                return "BULLISH_BOS"
         if htf_bias == "BEARISH" and close < last_sl:
-            return "BEARISH_BOS"
+            if self._has_displacement(symbol, self.ltf, "BEARISH"):
+                return "BEARISH_BOS"
 
         # CHoCH: reversal
         if htf_bias == "BULLISH" and close < last_sl:
@@ -356,7 +437,7 @@ class SMCEngine:
         return None
 
     def _has_displacement(self, symbol: str, tf: str, direction: str) -> bool:
-        """CHoCH 需至少 N 根強勢位移 K 棒確認"""
+        """BOS/CHoCH 需至少 N 根強勢位移 K 棒確認"""
         bars = list(self._bars[symbol][tf])
         n    = self.choch_displacement
         if len(bars) < n:
@@ -445,9 +526,7 @@ class SMCEngine:
         rrr       = self._calc_rrr(direction, entry, sl, tp1)
         source    = "CHOCH" if is_choch else "BOS"
 
-        disp_bars = None
-        if is_choch:
-            disp_bars = self.choch_displacement
+        disp_bars = self.choch_displacement if is_choch else None
 
         return SMCSignal(
             direction          = direction,
@@ -483,6 +562,12 @@ class SMCEngine:
 
     def _calc_levels(self, direction: str, price: float,
                      ob: dict, fvg: dict, candle: dict):
+        """
+        進場價 = OB/FVG 邊緣；
+        SL = 進場價外側 0.2%（緊貼結構）；
+        Invalidation = SL 外側再一個 buffer（結構失效點，比 SL 更深）；
+        TP1 = 2R；TP2 = 3R。
+        """
         if direction == "BUY":
             if ob:
                 entry = ob["low"]
@@ -494,7 +579,7 @@ class SMCEngine:
                 entry = price
                 sl    = price * 0.985
 
-            inval  = sl
+            inval  = sl * (1 - self._hard_sl_buffer)   # 結構失效點比 SL 更深
             tp1    = entry + (entry - sl) * 2
             tp2    = entry + (entry - sl) * 3
         else:
@@ -508,7 +593,7 @@ class SMCEngine:
                 entry = price
                 sl    = price * 1.015
 
-            inval  = sl
+            inval  = sl * (1 + self._hard_sl_buffer)
             tp1    = entry - (sl - entry) * 2
             tp2    = entry - (sl - entry) * 3
 

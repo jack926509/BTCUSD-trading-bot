@@ -15,15 +15,16 @@ class OrderError(Exception):
 
 
 class OrderExecutor:
-    def __init__(self, position_mgr, db, tg):
+    def __init__(self, position_mgr, db, tg, limit_order_timeout: int = 300):
         self.client = TradingClient(
             api_key    = os.getenv("ALPACA_API_KEY"),
             secret_key = os.getenv("ALPACA_SECRET_KEY"),
             paper      = os.getenv("ALPACA_PAPER_MODE", "true").lower() == "true",
         )
-        self.position_mgr = position_mgr
-        self.db           = db
-        self.tg           = tg
+        self.position_mgr         = position_mgr
+        self.db                   = db
+        self.tg                   = tg
+        self._limit_order_timeout = limit_order_timeout
 
         # fill_events: order_id → asyncio.Event（由 trade_updates WS 觸發）
         self.fill_events:  dict[str, asyncio.Event] = {}
@@ -95,7 +96,7 @@ class OrderExecutor:
             try:
                 order = self.client.submit_order(req)
                 await self.db.record_pending_order(str(order.id), side, notional)
-                result = await self._wait_fill_event(str(order.id), timeout=10)
+                result = await self._wait_fill_event(str(order.id), timeout=self._limit_order_timeout)
                 await self.db.confirm_order_filled(str(order.id))
                 return result
             except asyncio.TimeoutError:

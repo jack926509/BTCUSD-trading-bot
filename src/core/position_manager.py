@@ -70,6 +70,12 @@ class Position:
         else:
             return price <= self.take_profit_1
 
+    def is_tp2_hit(self, price: float) -> bool:
+        if self.side == "BUY":
+            return price >= self.take_profit_2
+        else:
+            return price <= self.take_profit_2
+
     def update_structural_trailing(self, candle: dict):
         """
         跟蹤 LTF Swing Low/High，而非固定百分比。
@@ -123,7 +129,7 @@ class PositionManager:
         self.db              = db
         self.tg              = tg
         self.smc             = smc
-        self.circuit         = circuit   # FIX P0-1/P0-2: injected by TradingSystem
+        self.circuit         = circuit
         self.executor        = None      # set by TradingSystem after init
 
         config_dir   = os.getenv("CONFIG_DIR", "/app/config")
@@ -194,13 +200,19 @@ class PositionManager:
             asyncio.create_task(self._execute_tp1(pos, price))
             return
 
+        # TP2 check（TRAILING 態，全倉出場）
+        if pos.state == PositionState.TRAILING and pos.is_tp2_hit(price):
+            pos.state = PositionState.CLOSING
+            asyncio.create_task(self._execute_tp2_close(pos, price))
+            return
+
         # Hard SL: 不等收盤，盤中觸發立即出場
         if pos.is_hard_sl_triggered(price):
             pos.state = PositionState.CLOSING
             asyncio.create_task(self._execute_hard_sl_close(pos, price))
 
     async def _execute_tp1(self, pos: Position, price: float):
-        """FIX P1-1: 實際送減倉單；FIX P1-2: 更新 last_pnl"""
+        """TP1 部分平倉；更新 last_pnl"""
         if not self.executor:
             return
         try:
@@ -208,22 +220,47 @@ class PositionManager:
             realized  = (price - pos.entry_price) * close_qty if pos.side == "BUY" else \
                         (pos.entry_price - price) * close_qty
 
-            # 實際送減倉市價單到 Alpaca
             await self.executor.partial_close(pos.symbol, pos.side, close_qty)
 
             pos.qty          -= close_qty
             pos.realized_pnl += realized
-            pos.last_pnl      = realized            # FIX P1-2
+            pos.last_pnl      = realized
             pos.stop_loss     = pos.entry_price     # Move SL to entry（已鎖利）
 
-            self.tg.mark_state_changed("SL_MOVED")  # FIX P1-7: sync call, no create_task
+            self.tg.mark_state_changed("SL_MOVED")
             asyncio.create_task(self.tg.notify_tp1(pos.symbol, pos, realized))
         except Exception as e:
             pos.state = PositionState.OPEN  # 回滾狀態，下次 tick 可重試
             await self.tg.alert(f"⚠️ TP1 減倉失敗：{e}", level="WARNING")
 
+    async def _execute_tp2_close(self, pos: Position, price: float):
+        """TP2 全倉出場（Trailing 後達到 3R 目標）"""
+        if not self.executor:
+            return
+        try:
+            order = await self.executor.close_position(pos)
+            fill  = float(getattr(order, "filled_avg_price", price) or price)
+            pos.last_pnl = (fill - pos.entry_price) * pos.qty if pos.side == "BUY" else \
+                           (pos.entry_price - fill) * pos.qty
+
+            if self.circuit:
+                self.circuit.record("TP2")
+
+            try:
+                await self.db.close_position(pos, "TP2", order)
+            except Exception as db_err:
+                await self.tg.alert(f"⚠️ TP2 DB 寫入失敗：{db_err}", level="WARNING")
+
+            await self.tg.notify_close(pos, "TP2",
+                extra=f"TP2 全倉出場：${fill:,.0f}，獲利 +${pos.last_pnl:,.0f}")
+            self.positions.pop(pos.symbol, None)
+            await self._on_close(pos, "TP2")
+        except Exception as e:
+            pos.state = PositionState.TRAILING
+            await self.tg.alert(f"🔴 TP2 平倉失敗：{e}", level="CRITICAL")
+
     async def _execute_hard_sl_close(self, pos: Position, trigger_price: float):
-        """FIX P0-1/P0-2: circuit.record；FIX P0-4: await db/tg"""
+        """circuit.record；await db/tg"""
         if not self.executor:
             return
         try:
@@ -232,11 +269,9 @@ class PositionManager:
             pos.last_pnl = (fill - pos.entry_price) * pos.qty if pos.side == "BUY" else \
                            (pos.entry_price - fill) * pos.qty
 
-            # FIX P0-1/P0-2: 直接呼叫 circuit.record，不透過 callback
             if self.circuit:
                 self.circuit.record("HARD_SL")
 
-            # FIX P0-4: await 確保關鍵資料寫入 DB 再刪除持倉
             try:
                 await self.db.close_position(pos, "HARD_SL", order)
             except Exception as db_err:
@@ -247,6 +282,7 @@ class PositionManager:
                 extra=f"插針觸發價：${trigger_price:,.0f}\n出場成交：${fill:,.0f}（市價）\n虧損：−${abs(pos.last_pnl):,.0f}"
             )
             self.positions.pop(pos.symbol, None)
+            await self._on_close(pos, "HARD_SL")
         except Exception as e:
             pos.state = PositionState.OPEN  # 回滾，允許下次 tick 重試
             await self.tg.alert(f"🔴 Hard SL 出場失敗：{e}", level="CRITICAL")
@@ -281,15 +317,13 @@ class PositionManager:
             old_sl = pos.stop_loss
             pos.update_structural_trailing(candle)
             if pos.stop_loss != old_sl:
-                self.tg.mark_state_changed("SL_MOVED")  # FIX P1-7: sync call
+                self.tg.mark_state_changed("SL_MOVED")
 
-        # Max hold check
+        # Max hold check：超時且虧損則出場；超時且獲利也出場（不無限持有）
         elapsed_h = (datetime.now(timezone.utc) - pos.open_time).total_seconds() / 3600
         if elapsed_h >= self._max_hold_hours:
-            float_pnl = pos.calc_float_pnl(candle["close"])
-            if float_pnl < 0:
-                pos.state = PositionState.CLOSING
-                asyncio.create_task(self._execute_invalidated_close(pos, candle))
+            pos.state = PositionState.CLOSING
+            asyncio.create_task(self._execute_invalidated_close(pos, candle))
 
     async def _handle_htf_bias_flip(self, pos: Position, symbol: str):
         new_bias = self.smc.get_htf_bias(symbol)
@@ -308,7 +342,6 @@ class PositionManager:
             )
 
     async def _execute_invalidated_close(self, pos: Position, candle: dict):
-        """FIX P0-1/P0-2: circuit.record；FIX P0-4: await db/tg"""
         if not self.executor:
             return
         try:
@@ -327,6 +360,7 @@ class PositionManager:
 
             await self.tg.notify_close(pos, "INVALIDATED")
             self.positions.pop(pos.symbol, None)
+            await self._on_close(pos, "INVALIDATED")
         except Exception as e:
             pos.state = PositionState.OPEN
             await self.tg.alert(f"🔴 INVALIDATED 平倉失敗：{e}", level="CRITICAL")
@@ -351,12 +385,12 @@ class PositionManager:
 
             await self.tg.notify_close(pos, "TRAILING_SL")
             self.positions.pop(pos.symbol, None)
+            await self._on_close(pos, "TRAILING_SL")
         except Exception as e:
             pos.state = PositionState.TRAILING
             await self.tg.alert(f"🔴 TRAILING_SL 平倉失敗：{e}", level="CRITICAL")
 
     async def _execute_htf_flip_close(self, pos: Position):
-        """FIX P0-1/P0-2: circuit.record；FIX P0-4: await db/tg"""
         if not self.executor:
             return
         try:
@@ -375,6 +409,7 @@ class PositionManager:
 
             await self.tg.notify_close(pos, "HTF_FLIP")
             self.positions.pop(pos.symbol, None)
+            await self._on_close(pos, "HTF_FLIP")
         except Exception as e:
             pos.state = PositionState.OPEN
             await self.tg.alert(f"🔴 HTF_FLIP 平倉失敗：{e}", level="CRITICAL")
@@ -385,7 +420,7 @@ class PositionManager:
         return len(self.positions) > 0
 
     async def adopt_orphan(self, symbol: str, pos_data):
-        """FIX P1-4: 接管 Alpaca 持倉並寫入 DB"""
+        """接管 Alpaca 持倉並寫入 DB"""
         try:
             qty       = float(pos_data.qty)
             avg_entry = float(pos_data.avg_entry_price)
@@ -402,9 +437,11 @@ class PositionManager:
                 take_profit_1      = avg_entry * (1.04 if side == "BUY" else 0.96),
                 take_profit_2      = avg_entry * (1.06 if side == "BUY" else 0.94),
                 invalidation_level = avg_entry * (0.975 if side == "BUY" else 1.025),
+                trailing_pivot_bars = self._trailing_pivot,
+                structural_buffer   = self._struct_buffer,
+                min_trail_pct       = self._min_trail_pct,
             )
 
-            # FIX P1-4: 寫入 DB，確保平倉時有 trade_id 可記錄
             try:
                 trade_id = await self.db.open_trade(
                     analysis_id  = 0,
@@ -426,12 +463,85 @@ class PositionManager:
             await self.tg.alert(f"⚠️ adopt_orphan 失敗：{e}", level="WARNING")
 
     async def force_close_missing(self, symbol: str):
-        """本地有記錄但 Alpaca 上已無持倉 → 清除"""
-        self.positions.pop(symbol, None)
+        """本地有記錄但 Alpaca 上已無持倉（Server Stop 觸發）→ 同步 DB 並清除"""
+        pos = self.positions.pop(symbol, None)
+        if not pos:
+            return
+        if pos.trade_id:
+            try:
+                await self.db.close_trade(
+                    trade_id        = pos.trade_id,
+                    close_price     = 0.0,    # 成交價未知（server stop 觸發）
+                    pnl_usd         = 0.0,
+                    close_reason    = "SERVER_STOP_TRIGGERED",
+                    broker_order_id = None,
+                )
+            except Exception as e:
+                await self.tg.alert(f"⚠️ force_close_missing DB 更新失敗：{e}", level="WARNING")
+        await self.tg.alert(
+            f"⚠️ Reconcile：{symbol} 持倉已在 Alpaca 消失（Server Stop 可能已觸發），已同步清除",
+            level="WARNING",
+        )
 
     async def reconcile_single(self, order):
-        """處理單筆訂單的 Reconciliation"""
-        pass
+        """Ghost 訂單確認成交後，建立本地追蹤持倉"""
+        try:
+            symbol     = order.symbol
+            side_val   = str(order.side.value).lower()
+            side       = "BUY" if side_val == "buy" else "SELL"
+            fill_price = float(order.filled_avg_price or 0)
+            qty        = float(order.filled_qty or 0)
+
+            if not fill_price or not qty:
+                await self.tg.alert(
+                    f"⚠️ reconcile_single：訂單 {order.id} 無有效成交資料，略過",
+                    level="WARNING"
+                )
+                return
+
+            if symbol in self.positions:
+                return  # 已追蹤，不重複建立
+
+            pos = Position(
+                symbol              = symbol,
+                side                = side,
+                entry_price         = fill_price,
+                qty                 = qty,
+                notional            = qty * fill_price,
+                stop_loss           = fill_price * (0.98  if side == "BUY" else 1.02),
+                hard_sl_price       = fill_price * (0.977 if side == "BUY" else 1.023),
+                take_profit_1       = fill_price * (1.04  if side == "BUY" else 0.96),
+                take_profit_2       = fill_price * (1.06  if side == "BUY" else 0.94),
+                invalidation_level  = fill_price * (0.975 if side == "BUY" else 1.025),
+                trailing_pivot_bars = self._trailing_pivot,
+                structural_buffer   = self._struct_buffer,
+                min_trail_pct       = self._min_trail_pct,
+            )
+
+            try:
+                trade_id = await self.db.open_trade(
+                    analysis_id   = 0,
+                    symbol        = symbol,
+                    side          = side,
+                    notional      = qty * fill_price,
+                    fill_price    = fill_price,
+                    limit_price   = fill_price,
+                    stop_loss     = pos.stop_loss,
+                    hard_sl_price = pos.hard_sl_price,
+                    take_profit   = pos.take_profit_1,
+                )
+                pos.trade_id = trade_id
+            except Exception as db_err:
+                await self.tg.alert(f"⚠️ reconcile_single DB 寫入失敗：{db_err}", level="WARNING")
+
+            self.positions[symbol] = pos
+            await self.tg.alert(
+                f"⚠️ Ghost 訂單 {order.id} 已成交並接管：{symbol} {side} "
+                f"{qty:.6f} @ ${fill_price:,.0f}（已套用預設 SL）",
+                level="WARNING",
+            )
+        except Exception as e:
+            await self.tg.alert(f"⚠️ reconcile_single 失敗：{e}", level="WARNING")
 
     def get_float_pnl(self, symbol: str, price: float) -> float:
         pos = self.positions.get(symbol)
