@@ -90,6 +90,13 @@ class Database:
             (_now(), order_id),
         )
 
+    async def dismiss_pending_order(self, order_id: str):
+        """Mark a cancelled/expired order as handled so startup scan ignores it."""
+        await self._execute(
+            "UPDATE pending_orders SET confirmed=1, confirmed_at=? WHERE order_id=?",
+            (_now(), order_id),
+        )
+
     # ── Analysis Log ─────────────────────────────────────────────────────────
 
     async def save_analysis(self, symbol: str, signal, description: str) -> int:

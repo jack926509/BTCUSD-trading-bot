@@ -281,15 +281,28 @@ class TradingSystem:
         notional    = self.risk.calc_notional(job.signal)
         limit_price = job.signal.entry_limit_price
 
+        direction   = job.signal.direction
+        side_str    = "LONG 🔺" if direction == "BUY" else "SHORT 🔻"
+        timeout_min = self.risk.get_limit_order_timeout() // 60
+
+        await self.tg.alert(
+            f"📋 掛出限價單　{job.symbol} {side_str}\n"
+            f"進場目標　<b>${limit_price:,.0f}</b>　等待最長 {timeout_min} 分鐘",
+            level="INFO",
+        )
+
         try:
-            order = await self.executor.place(
-                job.signal.direction, notional, limit_price
-            )
+            order = await self.executor.place(direction, notional, limit_price)
         except Exception as e:
-            await self.tg.alert(f"⚠️ 下單失敗：{e}", level="WARNING")
+            await self.tg.alert(f"⚠️ 下單失敗（API 錯誤）：{e}", level="WARNING")
             return
 
         if not order:
+            await self.tg.alert(
+                f"❌ 限價單過期　{job.symbol} {side_str}\n"
+                f"${limit_price:,.0f} 在 {timeout_min} 分鐘內未成交，訊號作廢",
+                level="INFO",
+            )
             return
 
         pos = await self.position_mgr.open(

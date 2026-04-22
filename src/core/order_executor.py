@@ -86,7 +86,6 @@ class OrderExecutor:
                 limit_price   = round(limit_price, 2),
             )
 
-        # FIX P0-3: 在迴圈外初始化，避免 submit_order 失敗時 except 裡出現 NameError
         order = None
         for attempt in range(3):
             try:
@@ -96,13 +95,16 @@ class OrderExecutor:
                 await self.db.confirm_order_filled(str(order.id))
                 return result
             except asyncio.TimeoutError:
+                # Price didn't reach the limit zone — expected SMC behaviour, not an error.
+                # Cancel the GTC order, clean up DB, and return None to signal "no fill".
                 if order:
-                    cancelled = await self._safe_cancel(str(order.id))
-                    if not cancelled:
-                        await self._verify_and_handle_order(str(order.id))
-                if attempt == 2:
-                    raise OrderError(f"下單超時（3次重試後）: {order.id if order else 'N/A'}")
-                await asyncio.sleep(0.5 * (2 ** attempt))
+                    await self._safe_cancel(str(order.id))
+                    await self.db.dismiss_pending_order(str(order.id))
+                print(
+                    f"[INFO] Limit order expired: {side} ${limit_price:,.0f} "
+                    f"not reached in {self._limit_order_timeout}s — signal discarded"
+                )
+                return None  # caller checks for None and moves on silently
             except Exception as e:
                 if attempt == 2:
                     raise OrderError(f"下單失敗：{e}")
