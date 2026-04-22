@@ -5,10 +5,13 @@ import traceback
 from alpaca.data.live import CryptoDataStream
 from alpaca.trading.client import TradingClient
 
-RECONNECT_DELAYS = [5, 10, 20, 40, 60, 90]
-CONN_LIMIT_DELAY = 60
-# Wait on first connect so previous deployment's WebSocket connection expires.
-STARTUP_DELAY    = int(os.getenv("WS_STARTUP_DELAY", "30"))
+RECONNECT_DELAYS  = [5, 10, 20, 40, 60, 90]
+# Alpaca server detects dead client via TCP keepalive, which can take 2-3 min.
+# Use increasing backoff so we're not spamming alerts while waiting.
+CONN_LIMIT_DELAYS = [90, 120, 120, 120]
+# Startup delay lets the previous deployment's WebSocket expire before we try.
+# Can be overridden via WS_STARTUP_DELAY=0 if deploying to a fresh API key.
+STARTUP_DELAY     = int(os.getenv("WS_STARTUP_DELAY", "90"))
 
 
 def _is_conn_limit(e: Exception) -> bool:
@@ -31,7 +34,6 @@ class DataFeed:
 
         self.on_tick         = on_tick
         self.on_candle_close = on_candle_close
-        # on_trade_update kept in signature for API compatibility but unused
         self.position_mgr    = position_mgr
         self.tg              = tg
 
@@ -42,6 +44,9 @@ class DataFeed:
         )
 
         self._crypto_stream: CryptoDataStream | None = None
+        # Reconcile triggers on the first successful message per connection session,
+        # not on failed connection attempts.
+        self._reconciled = False
 
     # ── Public ────────────────────────────────────────────────────────────────
 
@@ -50,23 +55,27 @@ class DataFeed:
             print(f"[FEED] 啟動延遲 {STARTUP_DELAY}s，等待舊連線釋放…")
             await asyncio.sleep(STARTUP_DELAY)
 
-        attempt = 0
+        attempt        = 0
+        conn_limit_cnt = 0
         while True:
             try:
                 await self._connect_and_stream()
-                attempt = 0
+                attempt        = 0
+                conn_limit_cnt = 0
             except Exception as e:
                 if _is_conn_limit(e):
-                    delay = CONN_LIMIT_DELAY
+                    conn_limit_cnt += 1
+                    delay = CONN_LIMIT_DELAYS[min(conn_limit_cnt - 1, len(CONN_LIMIT_DELAYS) - 1)]
                     print(
-                        f"[WARN] WebSocket: connection limit exceeded — "
-                        f"waiting {delay}s for stale connection to expire"
+                        f"[WARN] WebSocket: connection limit exceeded "
+                        f"(try {conn_limit_cnt}) — waiting {delay}s"
                     )
                     await self.tg.alert(
-                        f"⚠️ WebSocket 連線數已達上限，{delay}s 後重連",
+                        f"⚠️ WebSocket 連線數已達上限（第 {conn_limit_cnt} 次），{delay}s 後重連",
                         level="WARNING",
                     )
                 else:
+                    conn_limit_cnt = 0
                     delay = RECONNECT_DELAYS[min(attempt, len(RECONNECT_DELAYS) - 1)]
                     print(f"[ERROR] CryptoDataStream crashed (attempt {attempt + 1}): {repr(e)}")
                     print(traceback.format_exc())
@@ -99,24 +108,27 @@ class DataFeed:
             secret_key = self.secret_key,
         )
         self._crypto_stream = stream
+        self._reconciled    = False  # Reset so first message triggers reconcile
         stream.subscribe_bars(self._on_bar, "BTC/USD")
         stream.subscribe_trades(self._on_trade, "BTC/USD")
         print("WebSocket BTC/USD bars+trades subscribed")
-
-        asyncio.create_task(self._deferred_reconcile())
-        # Use _start_ws() instead of _run_forever() so that connection limit
-        # exceptions propagate immediately to our start() retry handler rather
-        # than being swallowed by _run_forever()'s internal retry loop.
+        # _start_ws() instead of _run_forever() so connection limit exceptions
+        # propagate immediately to our start() handler rather than being swallowed
+        # by _run_forever()'s internal retry loop.
         await stream._start_ws()
 
-    async def _deferred_reconcile(self):
-        await asyncio.sleep(0)
-        await self._reconcile_positions()
+    def _trigger_reconcile_once(self):
+        """Schedule reconcile on the first successful message per session."""
+        if not self._reconciled:
+            self._reconciled = True
+            asyncio.create_task(self._reconcile_positions())
 
     async def _on_trade(self, trade):
+        self._trigger_reconcile_once()
         await self.on_tick(trade.symbol, float(trade.price))
 
     async def _on_bar(self, bar):
+        self._trigger_reconcile_once()
         await self.on_candle_close(bar.symbol, bar)
 
     # ── Reconciliation ────────────────────────────────────────────────────────
