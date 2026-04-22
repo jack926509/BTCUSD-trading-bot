@@ -827,26 +827,31 @@ class TradingSystem:
         await self.tg.alert("Trading System 正在關閉（SIGTERM）", level="WARNING")
         for task in list(self._background_tasks):
             task.cancel()
+
+        # 優先關 WebSocket：送 close frame + 額外 2 秒讓 TCP FIN 完成，
+        # 讓 Alpaca 盡快釋放 session（防止下次啟動撞到連線上限）
         try:
-            await self.feed.stop()
-        except Exception:
-            pass
-        try:
-            await self.circuit._persist(self.db)
-        except Exception:
-            pass
-        try:
-            await self.risk._persist()
-        except Exception:
-            pass
-        try:
-            await self.db.close()
-        except Exception:
-            pass
-        try:
-            await self.tg.shutdown()
-        except Exception:
-            pass
+            await asyncio.wait_for(self.feed.stop(), timeout=5)
+            log.info("WebSocket closed cleanly")
+        except asyncio.TimeoutError:
+            log.warning("WebSocket close timed out after 5s")
+        except Exception as e:
+            log.warning("WebSocket close error: %s", e)
+        await asyncio.sleep(2)  # TCP FIN + Alpaca session release 寬限
+
+        for awaitable, tag in [
+            (self.circuit._persist(self.db), "circuit"),
+            (self.risk._persist(),            "risk"),
+            (self.db.close(),                 "db"),
+            (self.tg.shutdown(),              "tg"),
+        ]:
+            try:
+                await asyncio.wait_for(awaitable, timeout=3)
+            except asyncio.TimeoutError:
+                log.warning("%s shutdown timed out", tag)
+            except Exception as e:
+                log.warning("%s shutdown error: %s", tag, e)
+
         log.info("shutdown complete, exiting")
         os._exit(0)
 

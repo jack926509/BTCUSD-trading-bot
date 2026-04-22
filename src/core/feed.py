@@ -2,40 +2,77 @@ import asyncio
 import os
 import time
 import traceback
+from datetime import datetime, timezone
 
 from alpaca.data.live import CryptoDataStream
+from alpaca.data.historical import CryptoHistoricalDataClient
+from alpaca.data.requests import CryptoBarsRequest, CryptoLatestTradeRequest
+from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
 
 import logging
 log = logging.getLogger(__name__)
 
 # ── Reconnect policy ─────────────────────────────────────────────────────────
-# Normal errors: short exponential backoff.
 RECONNECT_DELAYS  = [5, 10, 20, 40, 60, 90]
 
-# Connection limit: longer backoff; Alpaca needs time to drop stale sessions.
-# Values tuned so 10 retries ≈ 30 min total window.
-CONN_LIMIT_DELAYS = [60, 120, 180, 180, 180, 180, 180, 180, 180, 180]
+# Alpaca 釋放舊 session 最長 ~90s；用 90→180s 階梯避免頻繁嘗試反被延遲
+CONN_LIMIT_DELAYS = [90, 120, 180, 180, 180, 180, 180, 180, 180, 180]
 
-# After this many consecutive connection-limit errors, self-destruct so the
-# container supervisor (Zeabur/Docker) restarts us with a fresh process state.
-# A fresh process guarantees no leftover asyncio/sockets from our side.
 MAX_CONN_LIMIT_RETRIES = int(os.getenv("WS_MAX_CONN_LIMIT_RETRIES", "10"))
 
-# Only send Telegram alerts for the first N connection-limit errors, then a
-# single summary. Prevents 30-minute alert spam.
+# First N alerts verbose，之後靜默避免洗版
 ALERT_FIRST_N          = 2
 
-# Wait on first connect so previous deployment's WebSocket expires.
-STARTUP_DELAY          = int(os.getenv("WS_STARTUP_DELAY", "60"))
+# 預設啟動等待 90s（Alpaca session grace 期間）
+# 若偵測到 lockfile 還新鮮（< 90s），會額外再等 90s
+STARTUP_DELAY          = int(os.getenv("WS_STARTUP_DELAY", "90"))
 
-# Minimum interval between consecutive connects (even on success→disconnect→retry)
-# so Alpaca doesn't mistake rapid reconnects for a second concurrent client.
+# 兩次 connect 之間最小間隔
 MIN_RECONNECT_GAP_SEC  = 3
+
+# WS lockfile：成功連線時寫入 timestamp，下次啟動讀回判斷舊實例是否剛掛
+WS_LOCKFILE = os.getenv("WS_LOCKFILE_PATH", "/app/data/ws_session.lock")
+
+# 完全跳過 WebSocket，改為 REST polling（排障逃生閥）
+WS_DISABLE  = os.getenv("WS_DISABLE", "false").lower() == "true"
 
 
 def _is_conn_limit(e: Exception) -> bool:
-    return "connection limit" in str(e).lower()
+    msg = str(e).lower()
+    return "connection limit" in msg or "too many connections" in msg or "429" in msg
+
+
+def _mask_key(key: str) -> str:
+    if not key:
+        return "(unset)"
+    return f"{key[:6]}…{key[-2:]}" if len(key) > 10 else f"{key[:3]}…"
+
+
+def _lockfile_age_sec() -> float | None:
+    """回傳 lockfile 距今秒數；不存在或讀取失敗回 None"""
+    try:
+        mtime = os.path.getmtime(WS_LOCKFILE)
+        return time.time() - mtime
+    except Exception:
+        return None
+
+
+def _touch_lockfile():
+    try:
+        os.makedirs(os.path.dirname(WS_LOCKFILE), exist_ok=True)
+        with open(WS_LOCKFILE, "w") as f:
+            f.write(datetime.now(timezone.utc).isoformat())
+    except Exception as e:
+        log.warning("lockfile write failed: %s", e)
+
+
+def _delete_lockfile():
+    try:
+        if os.path.exists(WS_LOCKFILE):
+            os.remove(WS_LOCKFILE)
+    except Exception:
+        pass
 
 
 class DataFeed:
@@ -88,9 +125,31 @@ class DataFeed:
         if not await self._verify_credentials():
             return
 
-        if STARTUP_DELAY > 0:
-            log.info("啟動延遲 %ds，等待舊連線釋放…", STARTUP_DELAY)
-            await asyncio.sleep(STARTUP_DELAY)
+        # 逃生閥：手動關閉 WS，改走 REST polling 模式
+        if WS_DISABLE:
+            log.warning("WS_DISABLE=true → 進入 REST-only 降級模式")
+            await self.tg.alert(
+                "ℹ️ WS_DISABLE=true 啟用，系統以 REST 輪詢模式運作\n"
+                "（延遲較高，僅供排障使用）",
+                level="WARNING",
+            )
+            await self._rest_polling_loop()
+            return
+
+        # Lockfile-based 協調：若舊 lockfile < 90 秒 → 舊實例剛退出，Alpaca
+        # session 尚未釋放，額外再等 90 秒
+        age = _lockfile_age_sec()
+        extra_wait = 0
+        if age is not None and age < 90:
+            extra_wait = int(90 - age) + 10
+            log.warning("偵測到 < 90s 的舊 lockfile（age=%ds），額外等待 %ds",
+                        int(age), extra_wait)
+
+        total_delay = STARTUP_DELAY + extra_wait
+        if total_delay > 0:
+            log.info("啟動延遲 %ds（base=%ds + lockfile=%ds），等待舊連線釋放…",
+                     total_delay, STARTUP_DELAY, extra_wait)
+            await asyncio.sleep(total_delay)
 
         attempt        = 0
         conn_limit_cnt = 0
@@ -99,6 +158,7 @@ class DataFeed:
             await self._rate_limit_reconnect()
             try:
                 await self._connect_and_stream()
+                _touch_lockfile()   # 成功連線 → 寫 lockfile 供下次啟動協調
                 if conn_limit_cnt > 0:
                     await self.tg.alert(
                         f"✅ WebSocket 已成功連線（經過 {conn_limit_cnt} 次等待）",
@@ -113,13 +173,15 @@ class DataFeed:
                 if _is_conn_limit(e):
                     conn_limit_cnt += 1
                     if conn_limit_cnt > MAX_CONN_LIMIT_RETRIES:
+                        # 連續 N 次連線上限 → 真的有另一程式佔用 key
+                        # 原本 os._exit(1) 會讓容器無限重啟仍打 API；改走 REST 降級
                         await self.tg.alert(
-                            f"🔴 WebSocket 連線上限持續 {conn_limit_cnt} 次，"
-                            f"疑似有其他程式佔用同一 API key。重啟容器以取得乾淨狀態。",
+                            self._build_conn_limit_critical_msg(conn_limit_cnt),
                             level="CRITICAL",
                         )
-                        log.critical("max connection-limit retries exceeded, exiting 1")
-                        os._exit(1)
+                        log.critical("max connection-limit retries exceeded → REST fallback")
+                        await self._rest_polling_loop()
+                        return
 
                     delay = CONN_LIMIT_DELAYS[min(conn_limit_cnt - 1, len(CONN_LIMIT_DELAYS) - 1)]
                     log.warning("connection limit (try %d/%d), waiting %ds",
@@ -127,13 +189,14 @@ class DataFeed:
 
                     if conn_limit_cnt <= ALERT_FIRST_N:
                         await self.tg.alert(
-                            f"⚠️ WebSocket 連線數已達上限（第 {conn_limit_cnt} 次），{delay}s 後重連",
+                            self._build_conn_limit_diagnostic_msg(conn_limit_cnt, delay),
                             level="WARNING",
                         )
                     elif not alerted_quiet:
                         alerted_quiet = True
                         await self.tg.alert(
-                            f"⚠️ 連線上限持續，後續重試靜默處理（最多 {MAX_CONN_LIMIT_RETRIES} 次後重啟容器）",
+                            f"⚠️ 連線上限持續，後續重試靜默處理"
+                            f"（{MAX_CONN_LIMIT_RETRIES} 次後轉 REST polling 降級模式）",
                             level="WARNING",
                         )
                 else:
@@ -157,6 +220,109 @@ class DataFeed:
     async def stop(self):
         """Explicitly close WebSocket on graceful shutdown."""
         await self._force_close_stream()
+        # 乾淨退出 → 刪 lockfile，讓下次啟動不用再等 90 秒
+        _delete_lockfile()
+
+    # ── 診斷訊息 ─────────────────────────────────────────────────────────────
+
+    def _build_conn_limit_diagnostic_msg(self, attempt: int, delay: int) -> str:
+        mode = "PAPER" if self.is_paper else "LIVE"
+        return (
+            f"⚠️ WebSocket 連線上限（第 {attempt} 次）\n"
+            f"模式：{mode}　API key：{_mask_key(self.api_key)}\n"
+            f"{delay}s 後重連。\n"
+            f"─────\n"
+            f"可能原因：\n"
+            f"1. 其他程式佔用同一 API key（本機 + Zeabur 同跑？）\n"
+            f"2. Zeabur redeploy 舊 session 還在 (~90s 釋放期)\n"
+            f"3. 上次 crash 沒送 close frame（~5 min zombie）\n"
+            f"─────\n"
+            f"若持續 10 次以上 → 自動降級 REST polling 模式"
+        )
+
+    def _build_conn_limit_critical_msg(self, total: int) -> str:
+        mode = "PAPER" if self.is_paper else "LIVE"
+        return (
+            f"🔴 WebSocket 連線上限持續 {total} 次失敗\n"
+            f"模式：{mode}　API key：{_mask_key(self.api_key)}\n"
+            f"─────\n"
+            f"系統降級為 REST polling（延遲較高但可運作）。\n"
+            f"排查步驟：\n"
+            f"① 檢查是否有其他機器 / 本機在跑同一 key\n"
+            f"② Alpaca dashboard 確認 active sessions\n"
+            f"③ 重新產生 API key（最徹底）\n"
+            f"④ 設 WS_DISABLE=true 永久關 WS（手動 REST）\n"
+            f"⑤ 排除後重啟容器（預設 STARTUP_DELAY=90s）"
+        )
+
+    # ── REST Polling 降級模式 ────────────────────────────────────────────────
+
+    async def _rest_polling_loop(self):
+        """
+        降級模式：完全跳過 WebSocket，改以 REST 輪詢：
+        - 每 5 秒抓 latest_trade 觸發 on_tick（持倉管理）
+        - 每 60 秒抓最新 M1 bar 觸發 on_candle_close（SMC 結構更新）
+        延遲較高但可作為連線上限 / WS_DISABLE 的 fallback
+        """
+        hist = CryptoHistoricalDataClient(
+            api_key=self.api_key, secret_key=self.secret_key,
+        )
+        # 先跑一次 reconcile
+        self._trigger_reconcile_once()
+
+        last_bar_ts  = 0
+        last_tick_ts = 0
+        loop = asyncio.get_running_loop()
+
+        while True:
+            now = loop.time()
+
+            # Latest trade（tick）— 每 5 秒
+            if now - last_tick_ts >= 5:
+                last_tick_ts = now
+                try:
+                    req = CryptoLatestTradeRequest(symbol_or_symbols="BTC/USD")
+                    latest = await asyncio.to_thread(hist.get_crypto_latest_trade, req)
+                    trade  = latest["BTC/USD"]
+                    price  = float(trade.price)
+                    await self.on_tick("BTC/USD", price)
+                    # spread 估算（REST 沒 BBO，近似為 0.02%）
+                    self.latest_spread_pct  = 0.0002
+                    self._spread_updated_at = now
+                except Exception as e:
+                    log.warning("REST latest_trade failed: %s", e)
+
+            # Latest M1 bar — 每 60 秒
+            if now - last_bar_ts >= 60:
+                last_bar_ts = now
+                try:
+                    from datetime import timedelta
+                    req = CryptoBarsRequest(
+                        symbol_or_symbols="BTC/USD",
+                        timeframe=TimeFrame.Minute,
+                        start=datetime.now(timezone.utc) - timedelta(minutes=3),
+                        limit=3,
+                    )
+                    bars = await asyncio.to_thread(hist.get_crypto_bars, req)
+                    df = bars.df
+                    if not df.empty:
+                        # 取最新一根已收盤的 M1 bar
+                        row = df.iloc[-2] if len(df) >= 2 else df.iloc[-1]
+                        class _FakeBar:
+                            pass
+                        b = _FakeBar()
+                        b.symbol    = "BTC/USD"
+                        b.open      = float(row["open"])
+                        b.high      = float(row["high"])
+                        b.low       = float(row["low"])
+                        b.close     = float(row["close"])
+                        b.volume    = float(row.get("volume", 0))
+                        b.timestamp = row.name[1] if hasattr(row.name, "__len__") else row.name
+                        await self.on_candle_close("BTC/USD", b)
+                except Exception as e:
+                    log.warning("REST bar poll failed: %s", e)
+
+            await asyncio.sleep(1)
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
