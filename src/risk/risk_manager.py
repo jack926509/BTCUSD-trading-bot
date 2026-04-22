@@ -36,33 +36,34 @@ class RiskManager:
 
     def calc_notional(self, signal) -> float:
         """
-        根據帳戶淨值與 risk_per_trade_pct 計算下單金額。
-        若 stop_loss 有效則用 R/R 法，否則 fallback 到固定比例。
+        下單金額計算：
+        - risk_per_trade_usd 有設定時，以固定虧損金額反推倉位大小
+        - 否則 fallback 到 equity × risk_per_trade_pct
+        notional = risk_amount / sl_distance_pct
         """
-        if self._account_equity is None or self._account_equity <= 0:
-            return self._cfg["btcusd"]["min_notional_usd"]
+        min_notional = self._cfg["btcusd"]["min_notional_usd"]
+        max_notional = self._cfg["btcusd"]["max_notional_usd"]
 
-        equity          = self._account_equity
-        risk_pct        = self._cfg["position"]["risk_per_trade_pct"]
-        risk_amount     = equity * risk_pct
-        min_notional    = self._cfg["btcusd"]["min_notional_usd"]
-        max_notional    = self._cfg["btcusd"]["max_notional_usd"]
+        # Fixed USD risk takes priority over percentage-based risk
+        risk_usd_fixed = self._cfg.get("position", {}).get("risk_per_trade_usd", None)
+        if risk_usd_fixed is not None:
+            risk_amount = float(risk_usd_fixed)
+        elif self._account_equity and self._account_equity > 0:
+            risk_amount = self._account_equity * self._cfg["position"]["risk_per_trade_pct"]
+        else:
+            return min_notional
 
         entry = getattr(signal, "entry_limit_price", None)
         sl    = getattr(signal, "stop_loss", None)
 
         if entry and sl and entry != sl:
             sl_distance_pct = abs(entry - sl) / entry
-            if sl_distance_pct > 0:
-                notional = risk_amount / sl_distance_pct
-            else:
-                notional = risk_amount / 0.01
+            notional = risk_amount / sl_distance_pct if sl_distance_pct > 0 else risk_amount / 0.005
         else:
-            notional = risk_amount / 0.01
+            notional = risk_amount / 0.005
 
         notional = max(min_notional, min(max_notional, notional))
-        notional = round(notional, 2)
-        return notional
+        return round(notional, 2)
 
     def is_auto_trade_enabled(self) -> bool:
         return self._cfg.get("auto_trade", False)

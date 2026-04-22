@@ -4,16 +4,17 @@ from datetime import datetime, timezone
 
 class CandleBuilder:
     """
-    M1 bar → M5 / H1 / H4 聚合。
+    M1 bar → M1 / H1 / H4 聚合。
     Alpaca CryptoDataStream 提供 1-minute bars，
     本模組將其聚合為策略所需的多週期 K 棒。
+    M1 timeframe passes each bar through as-is (period=1).
 
     FIX P1-6: 收盤判斷改為 period_start 邊界變化，
     不再依賴 bar_count >= minutes（加密貨幣有缺口時永遠達不到）。
     """
 
     TIMEFRAME_MINUTES = {
-        "M5":  5,
+        "M1":  1,
         "H1":  60,
         "H4":  240,
     }

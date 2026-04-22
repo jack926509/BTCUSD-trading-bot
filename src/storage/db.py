@@ -111,7 +111,7 @@ class Database:
                 (
                     _now(),
                     symbol,
-                    getattr(signal, "timeframe", "M5"),
+                    getattr(signal, "timeframe", "M1"),
                     getattr(signal, "direction", "HOLD"),
                     getattr(signal, "source", None),
                     getattr(signal, "htf_bias", None),

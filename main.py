@@ -197,30 +197,19 @@ class TradingSystem:
                 self.smc.seed_bars("BTC/USD", "H1", hourly[-200:])
                 print(f"Seeded H4: {len(h4_bars)} bars, H1: {len(hourly)} bars")
 
-            # Seed M5
+            # Seed M1 — bars arrive as raw M1, no aggregation needed
             req_m1 = CryptoBarsRequest(
                 symbol_or_symbols = "BTC/USD",
                 timeframe         = TimeFrame.Minute,
-                start             = datetime.now(timezone.utc) - timedelta(days=3),
-                limit             = 4320,
+                start             = datetime.now(timezone.utc) - timedelta(hours=4),
+                limit             = 240,
             )
             bars_m1 = hist_client.get_crypto_bars(req_m1)
             df_m1   = bars_m1.df
             if not df_m1.empty:
                 m1_bars = bars_to_dicts(df_m1)
-                m5_bars = []
-                for i in range(0, len(m1_bars) - 4, 5):
-                    chunk = m1_bars[i:i + 5]
-                    m5_bars.append({
-                        "open":      chunk[0]["open"],
-                        "high":      max(b["high"] for b in chunk),
-                        "low":       min(b["low"]  for b in chunk),
-                        "close":     chunk[-1]["close"],
-                        "volume":    sum(b["volume"] for b in chunk),
-                        "timestamp": chunk[-1]["timestamp"],
-                    })
-                self.smc.seed_bars("BTC/USD", "M5", m5_bars[-100:])
-                print(f"Seeded M5: {len(m5_bars)} bars")
+                self.smc.seed_bars("BTC/USD", "M1", m1_bars[-200:])
+                print(f"Seeded M1: {len(m1_bars)} bars")
 
         except Exception as e:
             print(f"[WARN] Historical bar seeding failed: {e}")

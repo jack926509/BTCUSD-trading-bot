@@ -4,7 +4,8 @@ account:
   max_weekly_loss_pct: 0.05
 
 position:
-  risk_per_trade_pct: 0.01
+  risk_per_trade_pct: 0.01   # fallback if risk_per_trade_usd not set
+  risk_per_trade_usd: 10     # fixed $10 max loss per trade (overrides pct)
   max_concurrent_trades: 1
   max_single_symbol_pct: 0.10
   min_rrr: 1.5

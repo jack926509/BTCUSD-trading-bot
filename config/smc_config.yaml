@@ -3,7 +3,7 @@ version: "7.0"
 timeframes:
   htf: "H4"
   mtf: "H1"
-  ltf: "M5"
+  ltf: "M1"
 
 htf_bars: 200
 ltf_bars: 100
@@ -18,17 +18,17 @@ structure:
 liquidity:
   order_block:
     enabled: true
-    max_age_bars: 24        # M5×24 = 2 h; keeps OBs fresh and relevant
-    min_body_ratio: 0.55    # slightly relaxed for M5 smaller candles
+    max_age_bars: 60        # M1×60 = 1 h; keeps OBs fresh and relevant
+    min_body_ratio: 0.55
     mitigation_type: close
     wick_penetration_threshold: 0.7
   fair_value_gap:
     enabled: true
-    min_gap_usd: 80         # M5 FVGs need minimum size to filter noise
+    min_gap_usd: 40         # M1 FVGs are smaller; $40 filters micro-gaps
     partial_fill_threshold: 0.5
   equal_highs_lows:
     enabled: true
-    tolerance_usd: 100      # tighter EQL tolerance on M5
+    tolerance_usd: 80       # tighter EQL tolerance on M1
   breaker_block:
     enabled: true
   sweep:

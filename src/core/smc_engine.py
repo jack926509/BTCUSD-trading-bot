@@ -21,7 +21,7 @@ class SMCSignal:
     invalidation_level: float = 0.0
     rrr:                float = 0.0
     price_at_signal:    float = 0.0
-    timeframe:          str   = "M5"
+    timeframe:          str   = "M1"
     conditions_met:     list  = field(default_factory=list)
     reject_reason:      str   = ""
     # BOS / CHoCH specific
@@ -53,7 +53,7 @@ class SMCEngine:
 
         self.htf = self._cfg["timeframes"]["htf"]   # H4
         self.mtf = self._cfg["timeframes"]["mtf"]   # H1
-        self.ltf = self._cfg["timeframes"]["ltf"]   # M5
+        self.ltf = self._cfg["timeframes"]["ltf"]   # M1
 
         # 每個 symbol 的 K 棒緩存
         self._bars:       dict = defaultdict(lambda: defaultdict(lambda: deque(maxlen=300)))
@@ -564,7 +564,7 @@ class SMCEngine:
                      ob: dict, fvg: dict, candle: dict):
         """
         進場價 = OB/FVG 邊緣；
-        SL = 進場價外側 0.5%（M5 BTC 平均波動 0.3-0.7%/bar，給足緩衝）；
+        SL = 進場價外側 0.5%（M1 BTC 短線，給足噪音緩衝）；
         Invalidation = SL 外側再加 hard_sl_buffer；
         TP1 = 2R；TP2 = 3R。
         """
