@@ -145,7 +145,7 @@ class TradingSystem:
                     await self.tg.alert(
                         f"🔴 DB 連線失敗（{max_attempts} 次後放棄）：{e}", level="CRITICAL"
                     )
-                    sys.exit(1)
+                    os._exit(1)
                 await asyncio.sleep(wait)
 
     async def _refresh_equity(self):
@@ -571,7 +571,7 @@ class TradingSystem:
         except Exception:
             pass
         print("[SHUTDOWN] 完成，退出")
-        sys.exit(0)
+        os._exit(0)
 
     # ── Main Run ──────────────────────────────────────────────────────────────
 
