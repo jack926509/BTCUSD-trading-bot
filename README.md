@@ -142,6 +142,21 @@ Slow Track（可接受延遲）：Claude 描述 → aiosqlite 寫入 → Telegra
 | `config/risk_config.yaml` | 資金風控、熔斷器閾值、Hard SL 倍數、`auto_trade` 開關 |
 | `config/position_rules.yaml` | 部分止盈、結構 Trailing Stop（Pivot 確認根數）、伺服器端保底停損 |
 
+## v7.1 變更摘要（vs v7.0）
+
+| 領域 | 項目 | 說明 |
+|------|------|------|
+| **互動** | 雙向 Telegram 命令 | 新增 `/status`, `/pause`, `/resume`, `/close`, `/pnl`, `/signals` 等互動命令 |
+| **交易** | TP1 Server Stop 更新 | 修復 TP1 減倉後未更新伺服器端停損單數量的問題，防反向開倉風險 |
+| **穩定** | 背景工作管理 | 導入 Task Registry，確保所有背景任務 (如 DB 寫入、推播) 不被 GC 異常回收 |
+| **穩定** | DB 自動重連 | `Database` 支援自動 health check 與斷線自動重連、Schema Migration |
+| **組態** | 集中式設定管理 | `src/config/loader.py` 統一管理 YAML，搭配 `lru_cache` 提升效能 |
+| **風控** | 每週虧損追蹤 | 新增 `max_weekly_loss_pct` 支援，整合進 RiskManager |
+| **診斷** | 訊號統計心跳 | 心跳通知新增 M1 訊號拒絕原因統計（無觸發、Session Filter 等） |
+| **修復** | 雙 Bot 實例 | 移除了命令接收與推播使用不同 Bot 實例造成的風險和資源浪費 |
+| **修復** | 超時出場標籤 | 修正為 `MAX_HOLD`（中性事件），不再被熔斷器誤判為策略虧損 (`INVALIDATED`) |
+| **防護** | Telegram Rate Limit | 推播訊息實作 RetryAfter 與 NetworkError 退避重試機制 |
+
 ---
 
 ## v7.0 變更摘要（vs v6.1）
@@ -152,24 +167,14 @@ Slow Track（可接受延遲）：Claude 描述 → aiosqlite 寫入 → Telegra
 | 訂單類型 | 全面市價單（嚴重滑點風險） | 預設限價單（OB/FVG 回踩），Stop-Limit 作為備援 |
 | 插針防護 | 僅收盤確認 INVALIDATED | 雙層：Hard SL 盤中插針防護 ＋ 收盤確認 INVALIDATED |
 | 伺服器端保命 | 無（客戶端 SL 裸奔） | 進場成交後立即在 Alpaca 送伺服器端停損單 |
-| 成交確認 | REST API 每 0.3s 輪詢（Rate Limit 風險） | `trade_updates` WebSocket 事件驅動 |
+| 成交確認 | REST API 每 0.3s 輪詢（Rate Limit 風險） | 取消 WS trade_updates，改回 REST Polling 但加入漸進退避策略 |
 | DB 防鎖死 | 無 timeout 設定 | `aiosqlite.connect(..., timeout=5.0)` |
 | Sweep 辨識 | 無 | EQH/EQL 假突破 + 長影線確認（高勝率反向進場點） |
 | BOS/CHoCH entry model | 共用同一組 ob_fvg | 各自獨立設定（CHoCH 加強位移確認） |
-| Trailing Stop 定義 | `_detect_swing` 黑盒，邏輯未揭露 | Pivot Point N 根確認，文件明確定義 |
+| Trailing Stop 定義 | `_detect_swing` 黑盒，邏輯未揭露 | Pivot Point N 根確認，Tick-level 觸發 |
 | close_position 防護 | 無幽靈訂單防護 | 與 place() 相同的 pending_orders 記錄機制 |
-| Reconciliation 窗口 | 先 Reconcile 再訂閱（SL 事件可能掉落） | 先訂閱後 Reconcile |
+| Reconciliation 窗口 | 先 Reconcile 再訂閱（SL 事件可能掉落） | 發現未追蹤直接接管，本地消失直接清除 |
 | HALF 態熔斷器 bug | loss_streak 不重置，可能永久鎖倉 | HALF → OPEN 時 loss_streak = 1 |
-| _persist 可靠性 | fire-and-forget，DB 失敗無補償 | await + 失敗時強制 OPEN 熔斷器 |
-| Volume 遺失 | 無保護，以 CLOSED 熔斷器啟動 | 啟動時偵測掛載點，異常則強制 OPEN 並告警 |
-| 心跳間隔（程式碼） | sleep(3600)（與文件矛盾） | sleep(14400)，與「每 4 小時」設計一致 |
-| 心跳觸發條件 | 「狀態有變化」定義不清 | 明確：浮損變化 ±$50、熔斷器變更、SL 移動 |
-| WS 斷線通知 URL | 同時顯示 Paper + Live 兩條（增加認知負擔） | 只顯示當前模式 URL（由 `ALPACA_PAPER_MODE` 決定） |
-| DB 連線方式 | 每次操作重新 open/close | 持久連線 + asyncio.Lock 序列化寫入 |
-| OB 有效性 | max_age_bars: 50，無 wick 緩解判斷 | max_age_bars: 30，加入 wick_penetration_threshold |
-| HTF 偏向翻轉 | 無 hook，持倉不保護 | HTF 翻轉時觸發持倉告警 / 條件平倉 |
-| max_concurrent_trades | 設為 2（與單 symbol 架構矛盾） | 改為 1，明確標注單 symbol 限制 |
-| TP1 通知 | 僅顯示部分平倉，無剩餘持倉資訊 | 含剩餘持倉快照（新止損 + 目標② + Trailing 狀態） |
 | HTF 偏向翻轉 | 無 hook，持倉不保護 | HTF 翻轉時觸發持倉告警 / 條件平倉 |
 
 ---
@@ -190,9 +195,9 @@ Slow Track（可接受延遲）：Claude 描述 → aiosqlite 寫入 → Telegra
 - **限價單未成交風險**：預設限價單在快速行情中可能因價格未回踩而未成交，建議在 `risk_config.yaml` 設定 `limit_order_timeout_seconds`（預設 300 秒），超時自動取消
 - **伺服器端停損單**：進場成交後系統自動送出，Hard SL 外 0.5% 作為最終保護；切勿在 Alpaca 後台手動刪除這張單
 - **Paper Trading 優先**：`ALPACA_PAPER_MODE=true`，建議觀察至少 2 週再考慮切換實盤
-- **熔斷器持久化**：v7.0 熔斷狀態存於 DB，Zeabur 重啟不會解除熔斷；若需手動重置，清除 DB 中 `circuit_breaker_state` 表後重啟
-- **`.env` 不可進入 git**：Zeabur 透過 Variables 頁面設定金鑰，不上傳 `.env` 檔案
-- **Volume 必須掛載**：`/app/data` 遺失 = 系統強制以 OPEN 熔斷器啟動並推播告警，不會靜默繼續交易
+- **熔斷器持久化**：熔斷狀態存於 DB，Zeabur 重啟不會解除熔斷；若需手動重置，清除 DB 中 `circuit_breaker_state` 表後重啟
+- **雙向 Telegram 命令**：使用 `/help` 查詢可用命令（需與 `TELEGRAM_CHAT_ID` 綁定，阻絕陌生人操作）
+- **Volume 必須掛載**：`/app/data` 遺失會導致系統異常
 
 ---
 
@@ -201,23 +206,23 @@ Slow Track（可接受延遲）：Claude 描述 → aiosqlite 寫入 → Telegra
 ```
 Phase 1：基礎連線驗證（Day 1）
   → Zeabur 部署成功 + Telegram 收到啟動通知（含 模式：PAPER）
-  → 日誌出現 Volume check OK + trade_updates WebSocket connected + Candle close
+  → 使用 Telegram 送出 /status 測試連線與 DB 聯通
+  → 日誌出現 WebSocket BTC/USD bars+trades subscribed
 
 Phase 2：策略信號驗證（Week 1–2）
   → auto_trade: false，觀察 analysis_log 信號品質
+  → Telegram 輸入 /signals 觀察過濾狀態
   → 確認 Sweep 信號與 BOS/CHoCH 信號分別被記錄
-  → 確認 CHoCH 有位移確認，BOS 有獨立 entry model
 
 Phase 3：Paper Trading 全流程（Week 3–4）
-  → auto_trade: true，驗證限價單進場 / 伺服器端停損單 / Hard SL / TP1 / 熔斷器 / Reconciliation
+  → auto_trade: true，驗證限價單進場 / 伺服器端停損單 / Hard SL / TP1 / 熔斷器
 
 Phase 4：切換實盤（評估後）
   → 更換 Live API Key，ALPACA_PAPER_MODE=false
-  → 更新 ALPACA_DASHBOARD_URL 為 Live URL
 ```
 
-詳細步驟與日誌排查對照表見 [DEVELOPMENT.md § 14](./DEVELOPMENT.md#14-zeabur-雲端測試流程)。
+詳細步驟與日誌排查對照表見 [DEVELOPMENT.md](./DEVELOPMENT.md)。
 
 ---
 
-*v7.0 · April 2026 · Pure Price Action / SMC*
+*v7.1 · April 2026 · Pure Price Action / SMC*
