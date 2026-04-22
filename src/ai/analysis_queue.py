@@ -2,6 +2,9 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any
 
+import logging
+log = logging.getLogger(__name__)
+
 
 @dataclass
 class AnalysisJob:
@@ -29,7 +32,7 @@ class AnalysisQueue:
         except asyncio.QueueFull:
             self._dropped += 1
             msg = f"[AnalysisQueue] 訊號佇列已滿，丟棄第 {self._dropped} 筆訊號 ({symbol})"
-            print(msg)
+            log.warning(msg)
             if self._tg and self._dropped % 10 == 1:
                 # 每 10 筆才推一次 Telegram，避免洗版
                 # R2 FIX: 保留 task 引用
@@ -49,6 +52,6 @@ class AnalysisQueue:
             try:
                 await handler(job)
             except Exception as e:
-                print(f"[AnalysisQueue] worker error: {e}")
+                log.warning("worker error: %s", e)
             finally:
                 self._queue.task_done()

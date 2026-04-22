@@ -3,6 +3,9 @@ import os
 from datetime import datetime, timezone
 from enum import Enum
 
+import logging
+log = logging.getLogger(__name__)
+
 
 class BreakerState(Enum):
     CLOSED = "CLOSED"
@@ -36,7 +39,7 @@ class CircuitBreaker:
             self.loss_streak = 0
             self.opened_at   = None
             await self._persist(db)
-            print("[CB] RESET_CIRCUIT_BREAKER=true → state forced to CLOSED")
+            log.info("RESET_CIRCUIT_BREAKER=true -> state forced to CLOSED")
             return
 
         row = await db.get_circuit_breaker_state()
@@ -57,10 +60,7 @@ class CircuitBreaker:
 
             await self.check_auto_recovery()
 
-        print(
-            f"Circuit breaker state restored: {self.state.value} "
-            f"(streak: {self.loss_streak})"
-        )
+        log.info("Circuit breaker state restored: %s (streak: %d)", self.state.value, self.loss_streak)
 
     async def check_auto_recovery(self):
         """

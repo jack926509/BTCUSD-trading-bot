@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import signal
 import sys
@@ -7,6 +8,14 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# P2-5: 統一 logging 以 LOG_LEVEL env 控制；子模組用 logging.getLogger(__name__)
+logging.basicConfig(
+    level   = os.getenv("LOG_LEVEL", "INFO").upper(),
+    format  = "%(asctime)s %(levelname)-7s [%(name)s] %(message)s",
+    datefmt = "%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("main")
 
 from alpaca.trading.client import TradingClient
 
@@ -89,6 +98,8 @@ class TradingSystem:
 
         self._shutdown  = False
         self._paused    = False  # runtime pause flag for /pause command
+        # P2-6 /close 二次確認：第一次收到命令只記錄時間戳，15 秒內再次觸發才真正平倉
+        self._close_confirm_at: float = 0.0
 
         # ── TG-C1: 注入命令回調 ───────────────────────────────────────────────
         self.tg.register_callbacks(
@@ -113,7 +124,7 @@ class TradingSystem:
     # ── Startup ───────────────────────────────────────────────────────────────
 
     async def startup(self):
-        print("Trading System v7.1 starting...")
+        log.info("Trading System v7.1 starting...")
 
         await self._check_volume()
         await self._connect_db_with_retry()
@@ -126,7 +137,7 @@ class TradingSystem:
         try:
             await self.risk.load_state(self.db)
         except Exception as e:
-            print(f"[BOOT] risk state load failed: {e}")
+            log.warning("risk state load failed: %s", e)
 
         await self._refresh_equity()
         await self.executor.scan_orphan_orders_on_startup()
@@ -147,11 +158,11 @@ class TradingSystem:
         for attempt in range(max_attempts):
             try:
                 await self.db.connect()
-                print("[BOOT] Database connected")
+                log.info("Database connected")
                 return
             except Exception as e:
                 wait = 2 ** attempt
-                print(f"[BOOT] DB connect failed (attempt {attempt+1}): {e}，{wait}s 後重試")
+                log.warning("DB connect failed (attempt %d): %s, retry in %ds", attempt+1, e, wait)
                 if attempt == max_attempts - 1:
                     await self.tg.alert(
                         f"🔴 DB 連線失敗（{max_attempts} 次後放棄）：{e}", level="CRITICAL"
@@ -172,15 +183,14 @@ class TradingSystem:
             buying  = float(account.buying_power)
             self.risk.set_equity(equity)
             auto_on = self.risk.is_auto_trade_enabled()
-            print(
-                f"[BOOT] Alpaca account: equity=${equity:,.2f}  "
-                f"buying_power=${buying:,.2f}  "
-                f"auto_trade={'ON' if auto_on else 'OFF'}"
+            log.info(
+                "Alpaca account: equity=$%.2f buying_power=$%.2f auto_trade=%s",
+                equity, buying, "ON" if auto_on else "OFF",
             )
             if not auto_on:
-                print("[BOOT] WARNING: auto_trade=false — signals will NOT place orders")
+                log.warning("auto_trade=false, signals will NOT place orders")
         except Exception as e:
-            print(f"[WARN] 無法取得帳戶淨值：{e}，使用最低名目金額")
+            log.warning("cannot fetch account equity: %s, using min notional", e)
 
     async def _check_volume(self):
         db_path = os.getenv("DB_PATH", "/app/data/trading.db")
@@ -192,7 +202,7 @@ class TradingSystem:
             )
             self.circuit.state = BreakerState.OPEN
         else:
-            print(f"[BOOT] Volume check OK: {os.path.dirname(db_path)} is mounted")
+            log.info("Volume check OK: %s is mounted", os.path.dirname(db_path))
 
     async def _seed_historical_bars(self):
         """系統啟動時用歷史 K 棒初始化 SMC 結構。
@@ -235,7 +245,7 @@ class TradingSystem:
             if not df_h4.empty:
                 h4_bars = bars_to_dicts(df_h4)
                 self.smc.seed_bars("BTC/USD", "H4", h4_bars[-200:])
-                print(f"Seeded H4: {len(h4_bars)} bars (native 4h)")
+                log.info("Seeded H4: %d bars (native 4h)", len(h4_bars))
 
             # H1
             req_h1 = CryptoBarsRequest(
@@ -249,7 +259,7 @@ class TradingSystem:
             if not df_h1.empty:
                 h1_bars = bars_to_dicts(df_h1)
                 self.smc.seed_bars("BTC/USD", "H1", h1_bars[-200:])
-                print(f"Seeded H1: {len(h1_bars)} bars")
+                log.info("Seeded H1: %d bars", len(h1_bars))
 
             # M1
             req_m1 = CryptoBarsRequest(
@@ -263,10 +273,10 @@ class TradingSystem:
             if not df_m1.empty:
                 m1_bars = bars_to_dicts(df_m1)
                 self.smc.seed_bars("BTC/USD", "M1", m1_bars[-200:])
-                print(f"Seeded M1: {len(m1_bars)} bars")
+                log.info("Seeded M1: %d bars", len(m1_bars))
 
         except Exception as e:
-            print(f"[WARN] Historical bar seeding failed: {e}")
+            log.warning("Historical bar seeding failed: %s", e)
 
     # ── Tick and Bar Handlers ─────────────────────────────────────────────────
 
@@ -277,7 +287,7 @@ class TradingSystem:
         await self.candle_builder.on_m1_bar(symbol, bar)
 
     async def _on_aggregated_candle_close(self, symbol: str, tf: str, candle: dict):
-        print(f"Candle close: {symbol} {tf}")
+        log.debug("Candle close: %s %s", symbol, tf)
 
         if tf == self.smc.ltf:
             await self.position_mgr.on_candle_close(symbol, candle)
@@ -514,7 +524,7 @@ class TradingSystem:
             try:
                 await self._verify_server_stops()
             except Exception as e:
-                print(f"[HB] verify server stops failed: {e}")
+                log.warning("verify server stops failed: %s", e)
 
             snapshot = self._build_snapshot()
             if force or self.tg.has_meaningful_state_change(snapshot):
@@ -546,32 +556,38 @@ class TradingSystem:
     # ── T1 / T7 每日 & 每週結算 ──────────────────────────────────────────────
 
     async def _recap_scheduler(self):
-        """等到下一個 UTC 00:00 推日報；週日 23:00 推週報"""
-        from datetime import timedelta
+        """
+        P2-3: 輪詢式 scheduler — 每 30 秒檢查一次是否跨過 UTC 00:00 尚未推播
+        比起 sleep_to_midnight 更能抵抗時間漂移 / 容器暫停 / 系統休眠
+        """
+        last_daily_date  = None   # 最後一次推過日報的日期（UTC）
+        last_weekly_iso  = None   # 最後一次推過週報的 ISO week key
         while True:
+            await asyncio.sleep(30)
             now = datetime.now(timezone.utc)
-            # 下個 UTC 00:00
-            next_midnight = (now + timedelta(days=1)).replace(
-                hour=0, minute=0, second=5, microsecond=0,
-            )
-            sleep_s = (next_midnight - now).total_seconds()
-            await asyncio.sleep(sleep_s)
+            today_iso = now.date().isoformat()
+            week_key  = f"{now.isocalendar().year}-W{now.isocalendar().week:02d}"
 
-            # 日報（昨天統計）
-            try:
-                yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
-                stats = await self._build_daily_recap(yesterday)
-                await self.tg.notify_daily_recap(stats)
-            except Exception as e:
-                print(f"[RECAP] daily failed: {e}")
+            # 日報：每天 UTC 00:00-00:05 視窗內，若今日尚未推過 → 推昨日統計
+            if now.hour == 0 and now.minute < 5 and last_daily_date != today_iso:
+                last_daily_date = today_iso
+                try:
+                    from datetime import timedelta
+                    y = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+                    stats = await self._build_daily_recap(y)
+                    await self.tg.notify_daily_recap(stats)
+                except Exception as e:
+                    log.warning("daily recap failed: %s", e)
 
-            # 週日 UTC 00:00 時補推上週週報
-            if datetime.now(timezone.utc).weekday() == 0:  # Monday = 0 → 剛結束週日
+            # 週報：週一 UTC 00:00-00:10 視窗，若本週尚未推過 → 推上週
+            if now.weekday() == 0 and now.hour == 0 and now.minute < 10 \
+                    and last_weekly_iso != week_key:
+                last_weekly_iso = week_key
                 try:
                     w_stats = await self._build_weekly_recap()
                     await self.tg.notify_weekly_recap(w_stats)
                 except Exception as e:
-                    print(f"[RECAP] weekly failed: {e}")
+                    log.warning("weekly recap failed: %s", e)
 
     async def _build_daily_recap(self, date_str: str) -> dict:
         stats = await self.db.get_daily_stats(date_str)
@@ -681,11 +697,32 @@ class TradingSystem:
 
     async def _tg_close(self) -> str:
         """
-        R4 FIX: 緊急平倉走完整 _execute_close 流程（DB, cleanup, TG notify），
-        但 reason=MANUAL_CLOSE 不觸發 circuit breaker 消耗。
+        /close 需二次確認：
+        第一次呼叫 → 記錄時間戳並回傳確認訊息；
+        15 秒內第二次呼叫 → 真正執行平倉。
         """
+        import time as _time
         if not self.position_mgr.has_open_positions():
+            self._close_confirm_at = 0.0
             return "ℹ️ 目前無持倉，無需平倉"
+
+        now = _time.monotonic()
+        if now - self._close_confirm_at > 15:
+            self._close_confirm_at = now
+            pos_list = []
+            for symbol, pos in self.position_mgr.positions.items():
+                pnl_str = f"{'+' if pos.last_pnl >= 0 else ''}{pos.last_pnl:,.0f}"
+                pos_list.append(f"  ₿ {symbol} {pos.side} ${pos.entry_price:,.0f}  PnL {pnl_str}")
+            return (
+                f"⚠️ <b>確認緊急平倉？</b>\n"
+                f"{'─' * 24}\n"
+                + "\n".join(pos_list)
+                + f"\n{'─' * 24}\n"
+                + "15 秒內再輸入 <code>/close</code> 確認執行"
+            )
+
+        # 第二次 /close → 執行
+        self._close_confirm_at = 0.0
         results = []
         for symbol, pos in list(self.position_mgr.positions.items()):
             try:
@@ -703,12 +740,12 @@ class TradingSystem:
     async def _tg_pause(self):
         """暫停自動交易（不影響已持倉的管理）"""
         self._paused = True
-        print("[CMD] 自動交易已暫停（/pause）")
+        log.info("auto trade paused via /pause")
 
     async def _tg_resume(self):
         """恢復自動交易"""
         self._paused = False
-        print("[CMD] 自動交易已恢復（/resume）")
+        log.info("auto trade resumed via /resume")
 
     async def _tg_pnl(self) -> str:
         """回傳損益摘要"""
@@ -780,7 +817,7 @@ class TradingSystem:
             if self._shutdown:
                 return
             self._shutdown = True
-            print(f"\n[SHUTDOWN] 收到 {sig_name}，開始優雅關閉...")
+            log.info("received %s, graceful shutdown start", sig_name)
             self._create_task(self._graceful_shutdown())
 
         for sig in (signal.SIGTERM, signal.SIGINT):
@@ -810,7 +847,7 @@ class TradingSystem:
             await self.tg.shutdown()
         except Exception:
             pass
-        print("[SHUTDOWN] 完成，退出")
+        log.info("shutdown complete, exiting")
         os._exit(0)
 
     # ── Main Run ──────────────────────────────────────────────────────────────

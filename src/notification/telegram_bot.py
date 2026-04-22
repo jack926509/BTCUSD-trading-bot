@@ -17,6 +17,9 @@ from telegram.constants import ParseMode
 from telegram.error import RetryAfter, TimedOut, NetworkError
 from telegram.ext import Application, CommandHandler, ContextTypes
 
+import logging
+log = logging.getLogger(__name__)
+
 
 # Telegram 4096-char 上限；預留 safety 餘裕
 _TG_MAX_LEN = 3900
@@ -116,7 +119,7 @@ class TelegramNotifier:
         """訊息發送 + RetryAfter 退避重試 + 4096 字截斷"""
         text = _truncate(text)
         if not self._bot or not self._chat_id:
-            print(f"[TG] {text[:200]}")
+            log.info("(no bot) %s", text[:200])
             return
 
         for attempt in range(retries):
@@ -131,18 +134,29 @@ class TelegramNotifier:
                 return
             except RetryAfter as e:
                 wait = e.retry_after + 1
-                print(f"[TG] rate-limited, sleeping {wait}s")
+                log.warning("rate-limited, sleeping %ds", wait)
                 await asyncio.sleep(wait)
             except (TimedOut, NetworkError) as e:
                 wait = 2 ** attempt
-                print(f"[TG] network error (attempt {attempt + 1}): {e!r}, retry in {wait}s")
+                log.warning("network error (attempt %d): %r, retry in %ds", attempt + 1, e, wait)
                 await asyncio.sleep(wait)
             except Exception as e:
-                print(f"[TG] send error: {e!r}")
+                log.error("send error: %r", e)
                 return
 
-    def _dashboard_button(self) -> Optional[InlineKeyboardMarkup]:
+    @staticmethod
+    def _resolve_dashboard_url() -> str:
+        """P2-4: 先讀 env；若未設則依 ALPACA_PAPER_MODE 自動推導"""
         url = os.getenv("ALPACA_DASHBOARD_URL", "").strip()
+        if url:
+            return url
+        is_paper = os.getenv("ALPACA_PAPER_MODE", "true").lower() == "true"
+        return ("https://app.alpaca.markets/paper/dashboard/overview"
+                if is_paper else
+                "https://app.alpaca.markets/live/dashboard/overview")
+
+    def _dashboard_button(self) -> Optional[InlineKeyboardMarkup]:
+        url = self._resolve_dashboard_url()
         if not url:
             return None
         return InlineKeyboardMarkup([[
@@ -572,6 +586,8 @@ class TelegramNotifier:
         if pos_snapshot and pos_snapshot != "無持倉":
             safe_snap = pos_snapshot if "<" in pos_snapshot else _esc(pos_snapshot)
             text += f"{'─' * 24}\n📍 持倉快照\n{safe_snap}\n"
+        # P2-4: URL 若環境變數缺失，由 _dashboard_button 自動推導
+        text += f"{'─' * 24}\n🔗 {_esc(self._resolve_dashboard_url())}"
         await self._send(text, reply_markup=self._dashboard_button())
 
     # ── TG-C1: Bidirectional Commands ─────────────────────────────────────────
@@ -672,7 +688,7 @@ class TelegramNotifier:
         Bot.Application 以 start_polling 方式長跑，收到命令後呼叫對應 handler。
         """
         if not self._token or not self._chat_id:
-            print("[TG] 命令介面跳過（TOKEN 或 CHAT_ID 未設定）")
+            log.info("命令介面跳過（TOKEN 或 CHAT_ID 未設定）")
             return
 
         self._app = Application.builder().token(self._token).build()
@@ -692,7 +708,7 @@ class TelegramNotifier:
         # R8 FIX: 統一使用 Application 的 Bot 實例，釋放初始的獨立 Bot
         self._bot = self._app.bot
 
-        print("[TG] 命令介面已啟動（polling mode）")
+        log.info("命令介面已啟動（polling mode）")
         try:
             # 無限等待，直到外部 task 取消
             await asyncio.Event().wait()

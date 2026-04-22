@@ -6,6 +6,9 @@ import traceback
 from alpaca.data.live import CryptoDataStream
 from alpaca.trading.client import TradingClient
 
+import logging
+log = logging.getLogger(__name__)
+
 # ── Reconnect policy ─────────────────────────────────────────────────────────
 # Normal errors: short exponential backoff.
 RECONNECT_DELAYS  = [5, 10, 20, 40, 60, 90]
@@ -86,7 +89,7 @@ class DataFeed:
             return
 
         if STARTUP_DELAY > 0:
-            print(f"[FEED] 啟動延遲 {STARTUP_DELAY}s，等待舊連線釋放…")
+            log.info("啟動延遲 %ds，等待舊連線釋放…", STARTUP_DELAY)
             await asyncio.sleep(STARTUP_DELAY)
 
         attempt        = 0
@@ -115,11 +118,12 @@ class DataFeed:
                             f"疑似有其他程式佔用同一 API key。重啟容器以取得乾淨狀態。",
                             level="CRITICAL",
                         )
-                        print("[FATAL] max connection-limit retries exceeded, exiting 1")
+                        log.critical("max connection-limit retries exceeded, exiting 1")
                         os._exit(1)
 
                     delay = CONN_LIMIT_DELAYS[min(conn_limit_cnt - 1, len(CONN_LIMIT_DELAYS) - 1)]
-                    print(f"[WARN] connection limit (try {conn_limit_cnt}/{MAX_CONN_LIMIT_RETRIES}), waiting {delay}s")
+                    log.warning("connection limit (try %d/%d), waiting %ds",
+                                conn_limit_cnt, MAX_CONN_LIMIT_RETRIES, delay)
 
                     if conn_limit_cnt <= ALERT_FIRST_N:
                         await self.tg.alert(
@@ -136,8 +140,8 @@ class DataFeed:
                     conn_limit_cnt = 0
                     alerted_quiet  = False
                     delay = RECONNECT_DELAYS[min(attempt, len(RECONNECT_DELAYS) - 1)]
-                    print(f"[ERROR] CryptoDataStream crashed (attempt {attempt + 1}): {repr(e)}")
-                    print(traceback.format_exc())
+                    log.error("CryptoDataStream crashed (attempt %d): %r\n%s",
+                              attempt + 1, e, traceback.format_exc())
                     if self.position_mgr.has_open_positions():
                         pos_snapshot = self._build_pos_snapshot()
                         await self.tg.notify_ws_disconnect(attempt + 1, delay, pos_snapshot)
@@ -164,10 +168,10 @@ class DataFeed:
             acct = await loop.run_in_executor(
                 None, self.trading_client.get_account
             )
-            print(f"[FEED] Alpaca 認證成功：account={acct.id}, status={acct.status}")
+            log.info("Alpaca 認證成功：account=%s status=%s", acct.id, acct.status)
             return True
         except Exception as e:
-            print(f"[FATAL] Alpaca 認證失敗：{e!r}")
+            log.error("Alpaca 認證失敗：%r", e)
             await self.tg.alert(
                 f"🔴 Alpaca API 認證失敗，無法啟動 WebSocket：{e!r}",
                 level="CRITICAL",
@@ -191,7 +195,7 @@ class DataFeed:
         stream.subscribe_bars(self._on_bar, "BTC/USD")
         stream.subscribe_trades(self._on_trade, "BTC/USD")
         stream.subscribe_quotes(self._on_quote, "BTC/USD")   # P0-2 spread filter
-        print("WebSocket BTC/USD bars+trades+quotes subscribed")
+        log.info("WebSocket BTC/USD bars+trades+quotes subscribed")
         # _start_ws() instead of _run_forever() so connection limit exceptions
         # propagate immediately to our retry handler (otherwise _run_forever's
         # internal retry loop would swallow them).
@@ -263,7 +267,7 @@ class DataFeed:
                     f"⚠️ Reconcile：{symbol} 持倉已消失，已同步清除", level="WARNING"
                 )
 
-            print("Reconciliation complete: no drift detected")
+            log.info("Reconciliation complete: no drift detected")
         except Exception as e:
             await self.tg.alert(f"🔴 Reconcile 失敗：{e}", level="CRITICAL")
 

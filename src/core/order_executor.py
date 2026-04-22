@@ -9,6 +9,9 @@ from alpaca.trading.requests import (
 )
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderStatus
 
+import logging
+log = logging.getLogger(__name__)
+
 
 class OrderError(Exception):
     pass
@@ -85,7 +88,7 @@ class OrderExecutor:
             try:
                 order = await self._get_order(order_id)
             except Exception as e:
-                print(f"[WARN] get_order_by_id({order_id}): {e}")
+                log.warning("get_order_by_id(%s): %s", order_id, e)
                 continue
 
             if order.status == OrderStatus.FILLED:
@@ -186,9 +189,9 @@ class OrderExecutor:
                 if order:
                     await self._safe_cancel(str(order.id))
                     await self.db.dismiss_pending_order(str(order.id))
-                print(
-                    f"[INFO] Limit order expired: {side} ${limit_price:,.0f} "
-                    f"not reached in {self._limit_order_timeout}s — signal discarded"
+                log.info(
+                    "Limit order expired: %s $%s not reached in %ds — signal discarded",
+                    side, f"{limit_price:,.0f}", self._limit_order_timeout,
                 )
                 return None
             except OrderError:
@@ -327,7 +330,7 @@ class OrderExecutor:
                 order = await self._submit(req)
                 return str(order.id)
             except Exception as e:
-                print(f"[WARN] server-side stop attempt {attempt + 1}/3 failed: {e}")
+                log.warning("server-side stop attempt {attempt + 1}/3 failed: {e}")
                 if attempt == 2:
                     await self.tg.alert(
                         f"伺服器端停損單送出失敗（3 次重試後放棄）：{e}",
@@ -348,8 +351,7 @@ class OrderExecutor:
             try:
                 await self._cancel_order(old_order_id)
             except Exception as e:
-                print(f"[INFO] cancel old server stop {old_order_id} failed "
-                      f"(may have triggered): {e}")
+                log.info("cancel old server stop %s failed (may have triggered): %s", old_order_id, e)
         return await self.place_server_side_stop(
             side=side, qty=qty, hard_sl_price=hard_sl_price, buffer_pct=buffer_pct,
         )
@@ -357,10 +359,10 @@ class OrderExecutor:
     # ── Ghost Order 防護 ──────────────────────────────────────────────────────
 
     async def scan_orphan_orders_on_startup(self):
-        print("Scanning orphan orders on startup...")
+        log.info("Scanning orphan orders on startup...")
         pending = await self.db.get_unconfirmed_orders()
         if not pending:
-            print("Scanning orphan orders on startup... none found.")
+            log.info("Scanning orphan orders on startup... none found.")
         for order_id in pending:
             await self._verify_and_handle_order(order_id)
 

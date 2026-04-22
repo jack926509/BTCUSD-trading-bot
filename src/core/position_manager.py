@@ -52,8 +52,9 @@ class Position:
     max_favorable_pnl:   float          = 0.0
     max_adverse_pnl:     float          = 0.0
 
-    # T2 Proximity alert 去重 flags
+    # T2 Proximity alert 去重 flags + P2-1 開倉靜默起始 monotonic
     _proximity_alerted:  set            = field(default_factory=set, repr=False)
+    _proximity_silent_until: float      = 0.0   # monotonic 時間點之前不推 proximity
 
     # Rolling candle window for trailing stop
     _candle_buffer: deque = field(
@@ -271,6 +272,9 @@ class PositionManager:
             take_profit  = signal.take_profit_1,
         )
         pos.trade_id           = trade_id
+        # P2-1: 開倉後 90 秒 proximity alert 靜默，避免進場即爆告警
+        import time as _time
+        pos._proximity_silent_until = _time.monotonic() + 90
         self.positions[symbol] = pos
         return pos
 
@@ -348,7 +352,8 @@ class PositionManager:
             pos.max_adverse_pnl = pos.last_pnl
 
         # T2 Proximity alert（距離 TP/SL 0.2% 內推一次）
-        await self._check_proximity_alert(pos, price)
+        # P2-2: 不 await 在 tick 主路徑上；fire-and-forget 避免 TG 退避卡 tick
+        self._create_task(self._check_proximity_alert(pos, price))
 
         # X2 多段出場：依序檢查未 filled 的 tier
         if self._tp_enabled and pos.state in (PositionState.OPEN, PositionState.TRAILING):
@@ -405,7 +410,10 @@ class PositionManager:
             )
 
     async def _check_proximity_alert(self, pos, price: float):
-        """T2：價格接近 TP/SL 0.2% 內時推一次"""
+        """T2 + P2-1：接近 TP/SL 0.2% 內推一次；開倉 90 秒內靜默"""
+        import time as _time
+        if _time.monotonic() < pos._proximity_silent_until:
+            return
         threshold = 0.002
         checks = [
             ("TP1", pos.take_profit_1),
