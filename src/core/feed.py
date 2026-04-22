@@ -24,9 +24,12 @@ MAX_CONN_LIMIT_RETRIES = int(os.getenv("WS_MAX_CONN_LIMIT_RETRIES", "10"))
 # First N alerts verbose，之後靜默避免洗版
 ALERT_FIRST_N          = 2
 
-# 預設啟動等待 90s（Alpaca session grace 期間）
-# 若偵測到 lockfile 還新鮮（< 90s），會額外再等 90s
-STARTUP_DELAY          = int(os.getenv("WS_STARTUP_DELAY", "90"))
+# 預設啟動等待 180s。Alpaca session grace 通常 60-90s，但以下情境需要更久：
+# - Zeabur rolling deploy 新舊容器重疊窗口
+# - API key 剛 regenerate（propagate 約 5-10 分鐘）
+# - 連線上限撞過一次後 Alpaca 端計數回復需要額外時間
+# 可用 WS_STARTUP_DELAY env 覆寫
+STARTUP_DELAY          = int(os.getenv("WS_STARTUP_DELAY", "180"))
 
 # 兩次 connect 之間最小間隔
 MIN_RECONNECT_GAP_SEC  = 3
@@ -232,12 +235,17 @@ class DataFeed:
             f"模式：{mode}　API key：{_mask_key(self.api_key)}\n"
             f"{delay}s 後重連。\n"
             f"─────\n"
-            f"可能原因：\n"
-            f"1. 其他程式佔用同一 API key（本機 + Zeabur 同跑？）\n"
-            f"2. Zeabur redeploy 舊 session 還在 (~90s 釋放期)\n"
-            f"3. 上次 crash 沒送 close frame（~5 min zombie）\n"
+            f"【第 1 次就撞到的常見原因】\n"
+            f"A. Zeabur 有 2 份 replica / 重複 service（最常見！）\n"
+            f"   → Dashboard 檢查 Services 是否有重複、Instances=1\n"
+            f"B. 剛 regenerate API key（propagate 需 5-10 分）\n"
+            f"   → 等 10 分鐘或改設 WS_STARTUP_DELAY=600\n"
+            f"C. 上次 crash 的 zombie session（~5 min TTL）\n"
             f"─────\n"
-            f"若持續 10 次以上 → 自動降級 REST polling 模式"
+            f"【立即繞道】Zeabur Variables 加 WS_DISABLE=true\n"
+            f"→ 走 REST polling 模式，bot 可繼續交易\n"
+            f"─────\n"
+            f"10 次以上 → 自動降級 REST polling"
         )
 
     def _build_conn_limit_critical_msg(self, total: int) -> str:
