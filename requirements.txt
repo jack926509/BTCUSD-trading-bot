@@ -5,3 +5,9 @@ python-telegram-bot>=21.0
 python-dotenv>=1.0.0
 pyyaml>=6.0
 pandas>=2.0.0
+# alpaca-py 的 transitive 依賴，Python 3.13 環境下需顯式宣告
+pytz>=2024.1
+# websockets + msgpack 也是 alpaca-py 的 transitive；補上避免
+# 新環境 pip 不自動帶入
+websockets>=12.0
+msgpack>=1.0.0
