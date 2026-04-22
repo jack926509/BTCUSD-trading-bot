@@ -1,0 +1,39 @@
+account:
+  currency: USD
+  max_daily_loss_pct: 0.02
+  max_weekly_loss_pct: 0.05
+
+position:
+  risk_per_trade_pct: 0.01   # fallback if risk_per_trade_usd not set
+  risk_per_trade_usd: 10     # fixed $10 max loss per trade (overrides pct)
+  max_concurrent_trades: 1
+  max_single_symbol_pct: 0.10
+  min_rrr: 1.5
+
+btcusd:
+  # Alpaca crypto min qty = 0.0001 BTC; at $93k ≈ $9.3 min notional.
+  # Set to $15 as a safe floor with margin above the exchange minimum.
+  min_notional_usd: 15
+  max_notional_usd: 5000
+  spread_filter_pct: 0.001
+  limit_order_timeout_seconds: 900
+
+circuit_breaker:
+  consecutive_losses: 3
+  pause_hours: 4
+  persist_state: true
+
+hard_sl:
+  enabled: true
+  buffer_pct: 0.003
+
+server_side_stop:
+  enabled: true
+  buffer_pct: 0.005
+
+# 設為 true 啟用自動下單；Paper 模式下仍受 ALPACA_PAPER_MODE 保護
+auto_trade: true
+
+# 測試模式：true = 訊號生成後直接市價成交（忽略限價回踩）
+# 策略驗證完成後改回 false 恢復限價單模式
+use_market_order: true

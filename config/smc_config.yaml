@@ -1,0 +1,83 @@
+version: "7.0"
+
+timeframes:
+  htf: "H4"
+  mtf: "H1"
+  ltf: "M1"
+
+htf_bars: 200
+ltf_bars: 100
+
+structure:
+  bos:
+    min_swing_bars: 5
+  choch:
+    require_displacement: true
+    displacement_min_candles: 2
+
+liquidity:
+  order_block:
+    enabled: true
+    max_age_bars: 60        # M1×60 = 1 h; keeps OBs fresh and relevant
+    min_body_ratio: 0.55
+    mitigation_type: close
+    wick_penetration_threshold: 0.7
+  fair_value_gap:
+    enabled: true
+    min_gap_usd: 40         # M1 FVGs are smaller; $40 filters micro-gaps
+    partial_fill_threshold: 0.5
+  equal_highs_lows:
+    enabled: true
+    tolerance_usd: 80       # tighter EQL tolerance on M1
+  breaker_block:
+    enabled: true
+  sweep:
+    enabled: true
+    wick_ratio: 2.0
+    require_htf_alignment: true
+
+entry:
+  require_htf_alignment: true
+
+  bos_entry_model: ob_fvg
+  choch_entry_model: fvg_only
+  sweep_entry_model: ob_fvg
+
+  premium_discount:
+    enabled: true
+    range_source: htf
+    strong_trend_relax_bars: 8
+
+  session_filter:
+    enabled: true
+    # Only trade London + NY sessions (07:00–20:00 UTC) — highest BTC liquidity.
+    # Block everything else: NY close, full Asia, pre-London.
+    no_entry_sessions:
+      - name: "Low_Liquidity"
+        utc_start: "20:00"
+        utc_end:   "07:00"
+    session_open_cooldown_bars: 2
+    affect_open_positions: false
+
+signal_logic:
+  ltf_trigger_alignment: strict
+
+ai:
+  model: "claude-haiku-4-5-20251001"
+  max_tokens: 600
+  timeout_seconds: 10
+  role: "describer"
+  forbidden_elements:
+    - "DXY"
+    - "VIX"
+    - "非農"
+    - "聯準會"
+    - "利率"
+    - "通膨"
+    - "CPI"
+    - "ETF 申購"
+    - "鏈上數據"
+    - "新聞"
+    - "財報"
+    - "信心"
+    - "勝率"
