@@ -67,6 +67,9 @@ class RiskManager:
     def is_auto_trade_enabled(self) -> bool:
         return self._cfg.get("auto_trade", False)
 
+    def is_market_order_mode(self) -> bool:
+        return self._cfg.get("use_market_order", False)
+
     def get_min_rrr(self) -> float:
         return self._cfg.get("position", {}).get("min_rrr", 1.5)
 

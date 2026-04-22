@@ -56,6 +56,31 @@ class OrderExecutor:
 
     # ── 進場（預設限價單） ─────────────────────────────────────────────────────
 
+    async def place_market(self, side: str, notional: float) -> object:
+        """Market order for testing — fills immediately at current price."""
+        req = MarketOrderRequest(
+            symbol        = "BTC/USD",
+            notional      = round(notional, 2),
+            side          = OrderSide.BUY if side == "BUY" else OrderSide.SELL,
+            time_in_force = TimeInForce.IOC,
+        )
+        order = None
+        for attempt in range(3):
+            try:
+                order = self.client.submit_order(req)
+                await self.db.record_pending_order(str(order.id), side, notional)
+                result = await self._wait_fill_event(str(order.id), timeout=30)
+                await self.db.confirm_order_filled(str(order.id))
+                return result
+            except asyncio.TimeoutError:
+                if order:
+                    await self.db.dismiss_pending_order(str(order.id))
+                raise OrderError(f"市價單成交超時（不應發生）: {order.id if order else 'N/A'}")
+            except Exception as e:
+                if attempt == 2:
+                    raise OrderError(f"市價單失敗：{e}")
+                await asyncio.sleep(0.5 * (2 ** attempt))
+
     async def place(
         self,
         side: str,
