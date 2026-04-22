@@ -228,22 +228,25 @@ class OrderExecutor:
     ) -> str:
         """
         進場成交後立即呼叫。
-        hard_sl_price 已含結構止損；server stop 再外加 buffer_pct（預設 0.5%）。
-        回傳 order_id 供 pos.server_stop_order_id 儲存。
+        Alpaca crypto 不支援純 Stop Order，改用 Stop-Limit。
+        stop_price 為觸發點（含 buffer），limit_price 再向外留 1% 滑價空間確保成交。
         """
         if side == "BUY":
-            stop_price = round(hard_sl_price * (1 - buffer_pct), 2)
-            stop_side  = OrderSide.SELL
+            stop_price  = round(hard_sl_price * (1 - buffer_pct), 2)
+            limit_price = round(stop_price * 0.99, 2)   # sell stop-limit：觸發後 limit 再低 1%
+            stop_side   = OrderSide.SELL
         else:
-            stop_price = round(hard_sl_price * (1 + buffer_pct), 2)
-            stop_side  = OrderSide.BUY
+            stop_price  = round(hard_sl_price * (1 + buffer_pct), 2)
+            limit_price = round(stop_price * 1.01, 2)   # buy stop-limit：觸發後 limit 再高 1%
+            stop_side   = OrderSide.BUY
 
-        req = StopOrderRequest(
+        req = StopLimitOrderRequest(
             symbol        = "BTC/USD",
             qty           = round(qty, 8),
             side          = stop_side,
             time_in_force = TimeInForce.GTC,
             stop_price    = stop_price,
+            limit_price   = limit_price,
         )
         try:
             order = self.client.submit_order(req)
