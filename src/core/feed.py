@@ -5,8 +5,10 @@ import traceback
 from alpaca.data.live import CryptoDataStream
 from alpaca.trading.client import TradingClient
 
-RECONNECT_DELAYS = [1, 2, 4, 8, 16, 30, 60]
-CONN_LIMIT_DELAY = 90
+RECONNECT_DELAYS = [5, 10, 20, 40, 60, 90]
+CONN_LIMIT_DELAY = 60
+# Wait on first connect so previous deployment's WebSocket connection expires.
+STARTUP_DELAY    = int(os.getenv("WS_STARTUP_DELAY", "30"))
 
 
 def _is_conn_limit(e: Exception) -> bool:
@@ -44,6 +46,10 @@ class DataFeed:
     # ── Public ────────────────────────────────────────────────────────────────
 
     async def start(self):
+        if STARTUP_DELAY > 0:
+            print(f"[FEED] 啟動延遲 {STARTUP_DELAY}s，等待舊連線釋放…")
+            await asyncio.sleep(STARTUP_DELAY)
+
         attempt = 0
         while True:
             try:
@@ -53,11 +59,11 @@ class DataFeed:
                 if _is_conn_limit(e):
                     delay = CONN_LIMIT_DELAY
                     print(
-                        f"[WARN] CryptoDataStream: connection limit exceeded — "
+                        f"[WARN] WebSocket: connection limit exceeded — "
                         f"waiting {delay}s for stale connection to expire"
                     )
                     await self.tg.alert(
-                        f"⚠️ WebSocket 連線數已達上限，等待 {delay}s 後重連",
+                        f"⚠️ WebSocket 連線數已達上限，{delay}s 後重連",
                         level="WARNING",
                     )
                 else:
@@ -98,7 +104,10 @@ class DataFeed:
         print("WebSocket BTC/USD bars+trades subscribed")
 
         asyncio.create_task(self._deferred_reconcile())
-        await stream._run_forever()
+        # Use _start_ws() instead of _run_forever() so that connection limit
+        # exceptions propagate immediately to our start() retry handler rather
+        # than being swallowed by _run_forever()'s internal retry loop.
+        await stream._start_ws()
 
     async def _deferred_reconcile(self):
         await asyncio.sleep(0)
