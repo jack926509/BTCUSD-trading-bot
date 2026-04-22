@@ -224,17 +224,24 @@ class SMCEngine:
             if all(pivot["low"] < b["low"] for b in left + right):
                 swing_lows.append(pivot["low"])
 
-        if len(swing_highs) < 2 or len(swing_lows) < 2:
-            return  # 資料不足，保持前值
+        # P1-7: 3-point confirmation — 需連 3 根 swing 同向才翻牌，避震盪 flip-flop
+        if len(swing_highs) < 3 or len(swing_lows) < 3:
+            # 回退 2-point（過渡期；資料逐步累積後 3-point 生效）
+            if len(swing_highs) >= 2 and len(swing_lows) >= 2:
+                if swing_highs[-1] > swing_highs[-2] and swing_lows[-1] > swing_lows[-2]:
+                    self._htf_bias[symbol] = "BULLISH"
+                elif swing_highs[-1] < swing_highs[-2] and swing_lows[-1] < swing_lows[-2]:
+                    self._htf_bias[symbol] = "BEARISH"
+            return
 
-        hh = swing_highs[-1] > swing_highs[-2]  # Higher High
-        hl = swing_lows[-1]  > swing_lows[-2]   # Higher Low
-        lh = swing_highs[-1] < swing_highs[-2]  # Lower High
-        ll = swing_lows[-1]  < swing_lows[-2]   # Lower Low
+        hh3 = swing_highs[-1] > swing_highs[-2] > swing_highs[-3]
+        hl3 = swing_lows[-1]  > swing_lows[-2]  > swing_lows[-3]
+        lh3 = swing_highs[-1] < swing_highs[-2] < swing_highs[-3]
+        ll3 = swing_lows[-1]  < swing_lows[-2]  < swing_lows[-3]
 
-        if hh and hl:
+        if hh3 and hl3:
             self._htf_bias[symbol] = "BULLISH"
-        elif lh and ll:
+        elif lh3 and ll3:
             self._htf_bias[symbol] = "BEARISH"
         # else: 結構不明確，保持前值
 
@@ -279,6 +286,17 @@ class SMCEngine:
 
         if body_ratio < self.ob_min_body_ratio:
             return
+
+        # P1-6: OB volume confirmation — smart money footprint 需有量能支持
+        vol_mult = cfg.get("volume_multiplier", 1.5)
+        if vol_mult > 0 and len(bars) >= 20:
+            recent_vols = [b.get("volume", 0) for b in bars[-21:-1]]  # 不含當前
+            recent_vols = [v for v in recent_vols if v > 0]
+            if recent_vols:
+                avg_vol  = sum(recent_vols) / len(recent_vols)
+                prev2_v  = prev2.get("volume", 0)
+                if avg_vol > 0 and prev2_v < avg_vol * vol_mult:
+                    return  # 量能不足，不認列此 OB
 
         obs = self._order_blocks[symbol][tf]
 
@@ -454,7 +472,11 @@ class SMCEngine:
             direction = "BUY" if sweep["direction"] == "BULLISH" else "SELL"
             if not self._is_in_discount_zone(symbol, direction, candle["close"]):
                 return SMCSignal(reject_reason="SWEEP_NOT_IN_DISCOUNT_ZONE")
-            return self._build_sweep_signal(symbol, candle, sweep, htf_bias)
+            sig = self._build_sweep_signal(symbol, candle, sweep, htf_bias)
+            if sig.direction != "HOLD" and self.ote_enabled:
+                if not self._is_in_ote(symbol, direction, sig.entry_limit_price):
+                    return SMCSignal(reject_reason="SWEEP_ENTRY_NOT_IN_OTE")
+            return sig
 
         # 2. Check BOS / CHoCH
         ltf_trigger = self._detect_bos_choch(symbol, candle)
@@ -471,15 +493,16 @@ class SMCEngine:
         is_choch  = "CHOCH" in ltf_trigger
         direction = "BUY" if "BULLISH" in ltf_trigger else "SELL"
 
-        # E1 Premium/Discount
+        # E1 Premium/Discount（以當前 close 做粗濾）
         if not self._is_in_discount_zone(symbol, direction, candle["close"]):
             return SMCSignal(reject_reason="NOT_IN_DISCOUNT_ZONE")
 
-        # E6 OTE
-        if not self._is_in_ote(symbol, direction, candle["close"]):
-            return SMCSignal(reject_reason="NOT_IN_OTE")
-
-        return self._build_structure_signal(symbol, candle, ltf_trigger, htf_bias, is_choch)
+        # E6 OTE 在 _build_structure_signal 內以「entry 位置」精判
+        sig = self._build_structure_signal(symbol, candle, ltf_trigger, htf_bias, is_choch)
+        if sig.direction != "HOLD" and self.ote_enabled:
+            if not self._is_in_ote(symbol, direction, sig.entry_limit_price):
+                return SMCSignal(reject_reason="ENTRY_NOT_IN_OTE")
+        return sig
 
     def _detect_bos_choch(self, symbol: str, candle: dict) -> Optional[str]:
         sh_list  = self._swing_highs[symbol][self.ltf]

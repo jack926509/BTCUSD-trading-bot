@@ -69,11 +69,15 @@ class DataFeed:
         )
 
         self._crypto_stream: CryptoDataStream | None = None
-        # Reconcile fires on first message per connection session, never on failed
-        # connect attempts.
         self._reconciled        = False
-        self._reconcile_task    = None     # R3 FIX: 保留 task 引用
+        self._reconcile_task    = None
         self._last_connect_at   = 0.0
+
+        # P0-2: Spread filter 需要的最新 bid/ask/spread
+        self.latest_bid:        float = 0.0
+        self.latest_ask:        float = 0.0
+        self.latest_spread_pct: float = 0.0
+        self._spread_updated_at: float = 0.0
 
     # ── Public ────────────────────────────────────────────────────────────────
 
@@ -186,7 +190,8 @@ class DataFeed:
         self._reconciled    = False
         stream.subscribe_bars(self._on_bar, "BTC/USD")
         stream.subscribe_trades(self._on_trade, "BTC/USD")
-        print("WebSocket BTC/USD bars+trades subscribed")
+        stream.subscribe_quotes(self._on_quote, "BTC/USD")   # P0-2 spread filter
+        print("WebSocket BTC/USD bars+trades+quotes subscribed")
         # _start_ws() instead of _run_forever() so connection limit exceptions
         # propagate immediately to our retry handler (otherwise _run_forever's
         # internal retry loop would swallow them).
@@ -215,6 +220,27 @@ class DataFeed:
     async def _on_bar(self, bar):
         self._trigger_reconcile_once()
         await self.on_candle_close(bar.symbol, bar)
+
+    async def _on_quote(self, quote):
+        """P0-2 更新最新 BBO，供 spread filter 使用"""
+        bid = float(getattr(quote, "bid_price", 0) or 0)
+        ask = float(getattr(quote, "ask_price", 0) or 0)
+        if bid <= 0 or ask <= 0 or ask < bid:
+            return
+        mid = (bid + ask) / 2
+        self.latest_bid         = bid
+        self.latest_ask         = ask
+        self.latest_spread_pct  = (ask - bid) / mid
+        self._spread_updated_at = asyncio.get_running_loop().time()
+
+    def get_spread_pct(self, max_age_sec: float = 10.0) -> float | None:
+        """回傳最新 spread 比例；過期回 None 讓呼叫者決定（降級放行 / 阻擋）"""
+        if self._spread_updated_at <= 0:
+            return None
+        now = asyncio.get_running_loop().time()
+        if now - self._spread_updated_at > max_age_sec:
+            return None
+        return self.latest_spread_pct
 
     # ── Reconciliation ────────────────────────────────────────────────────────
 

@@ -22,6 +22,8 @@ liquidity:
     min_body_ratio: 0.55
     mitigation_type: close
     wick_penetration_threshold: 0.7
+    # P1-6: OB 前驅蠟燭需 volume > 近 20 根均量 × 1.5
+    volume_multiplier: 1.5
   fair_value_gap:
     enabled: true
     min_gap_usd: 40         # M1 FVGs are smaller; $40 filters micro-gaps

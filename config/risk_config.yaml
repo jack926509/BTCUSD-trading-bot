@@ -29,7 +29,9 @@ hard_sl:
 
 server_side_stop:
   enabled: true
-  buffer_pct: 0.005
+  # P0-3: 0.5% → 0.2%，避免三層 buffer（hard_sl 0.3 + server 0.5 + limit inner 1.0）
+  # 累積到 1.8% 放大保底虧損
+  buffer_pct: 0.002
 
 # 設為 true 啟用自動下單；Paper 模式下仍受 ALPACA_PAPER_MODE 保護
 auto_trade: true

@@ -302,13 +302,15 @@ class OrderExecutor:
         進場成交後立即呼叫。Alpaca crypto 不支援純 Stop Order，用 Stop-Limit。
         失敗重試 3 次，全部失敗回傳 None（上層可據此強制平倉）。
         """
+        # P0-3: stop-limit inner buffer 1% → 0.3%；若快速行情 limit 跳過，
+        # 由 client-side on_tick 的 Hard SL 延遲確認作為最後兜底（3 秒內強平）
         if side == "BUY":
             stop_price  = round(hard_sl_price * (1 - buffer_pct), 2)
-            limit_price = round(stop_price * 0.99, 2)
+            limit_price = round(stop_price * 0.997, 2)
             stop_side   = OrderSide.SELL
         else:
             stop_price  = round(hard_sl_price * (1 + buffer_pct), 2)
-            limit_price = round(stop_price * 1.01, 2)
+            limit_price = round(stop_price * 1.003, 2)
             stop_side   = OrderSide.BUY
 
         req = StopLimitOrderRequest(

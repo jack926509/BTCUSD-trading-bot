@@ -327,6 +327,17 @@ class TradingSystem:
 
         await self._refresh_equity()
 
+        # P0-2 Spread filter：快速行情時 spread 擴大，跳過進場
+        spread = self.feed.get_spread_pct() if hasattr(self.feed, "get_spread_pct") else None
+        if spread is not None:
+            max_spread = self.risk.get_spread_filter_pct()
+            if spread > max_spread:
+                await self.tg.alert(
+                    f"Spread {spread*100:.3f}% > 門檻 {max_spread*100:.3f}%，跳過訊號",
+                    level="INFO",
+                )
+                return
+
         notional    = self.risk.calc_notional(job.signal)
         limit_price = job.signal.entry_limit_price
         direction   = job.signal.direction
@@ -409,6 +420,52 @@ class TradingSystem:
         except Exception as e:
             await self.tg.alert(f"Slow Track 記錄失敗：{e}", level="WARNING")
 
+    async def _verify_server_stops(self):
+        """
+        P0-4: 每次 heartbeat 驗證所有持倉的 server_stop 仍在 Alpaca。
+        若被外部取消 / 已觸發 / 狀態異常 → 補送一張新的 server stop。
+        """
+        from alpaca.trading.enums import OrderStatus
+        for symbol, pos in list(self.position_mgr.positions.items()):
+            if not pos.server_stop_order_id:
+                # 本地已知沒 stop → 補一張
+                try:
+                    new_id = await self.executor.place_server_side_stop(
+                        side          = pos.side,
+                        qty           = pos.qty,
+                        hard_sl_price = pos.hard_sl_price,
+                        buffer_pct    = self.risk.get_server_stop_buffer(),
+                    )
+                    if new_id:
+                        pos.server_stop_order_id = new_id
+                        await self.tg.alert(
+                            f"{symbol} 偵測 server stop 缺失，已補送（order={new_id}）",
+                            level="WARNING",
+                        )
+                except Exception:
+                    pass
+                continue
+
+            try:
+                order = await self.executor._get_order(pos.server_stop_order_id)
+            except Exception:
+                continue
+            if order.status in (OrderStatus.CANCELED, OrderStatus.EXPIRED, OrderStatus.REJECTED):
+                await self.tg.alert(
+                    f"{symbol} server stop 已 {order.status}，重送保底",
+                    level="CRITICAL",
+                )
+                try:
+                    new_id = await self.executor.place_server_side_stop(
+                        side          = pos.side,
+                        qty           = pos.qty,
+                        hard_sl_price = pos.hard_sl_price,
+                        buffer_pct    = self.risk.get_server_stop_buffer(),
+                    )
+                    pos.server_stop_order_id = new_id
+                except Exception:
+                    pass
+
     async def _force_close_all(self, reason: str):
         """風控上限觸發時強制平倉所有持倉（MANUAL_CLOSE reason 不計入熔斷器）"""
         if not self.position_mgr.has_open_positions():
@@ -447,11 +504,17 @@ class TradingSystem:
             now   = asyncio.get_running_loop().time()
             force = (now - last_forced) >= 14400
 
-            # 熔斷器 OPEN 到期自動轉 HALF（長時間運行也能恢復）
+            # 熔斷器 OPEN 到期自動轉 HALF
             try:
                 await self.circuit.check_auto_recovery()
             except Exception:
                 pass
+
+            # P0-4 伺服器端停損備援：若持倉的 server stop 意外消失，重送
+            try:
+                await self._verify_server_stops()
+            except Exception as e:
+                print(f"[HB] verify server stops failed: {e}")
 
             snapshot = self._build_snapshot()
             if force or self.tg.has_meaningful_state_change(snapshot):

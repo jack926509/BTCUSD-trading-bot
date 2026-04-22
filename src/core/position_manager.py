@@ -214,11 +214,25 @@ class PositionManager:
 
         notional = fill_price * qty
 
-        # X2: 依 config tiers 生成本倉位的出場目標
+        # P0-1: 若 TP 非結構型（2R / 3R fallback），以真實 fill_price 重算
+        # 避免 entry_limit_price 與 fill_price 偏差導致 R 倍數失真
+        use_structural_tp = getattr(signal, "tp_is_structural", False)
+        if use_structural_tp:
+            tp1_real = signal.take_profit_1
+            tp2_real = signal.take_profit_2
+        else:
+            r = abs(fill_price - signal.stop_loss)
+            if signal.direction == "BUY":
+                tp1_real = round(fill_price + r * 2, 2)
+                tp2_real = round(fill_price + r * 3, 2)
+            else:
+                tp1_real = round(fill_price - r * 2, 2)
+                tp2_real = round(fill_price - r * 3, 2)
+
         tp_tiers = []
         for tier in self._tp_tiers_cfg:
             target = tier.get("target", "tp1")
-            price  = signal.take_profit_1 if target == "tp1" else signal.take_profit_2
+            price  = tp1_real if target == "tp1" else tp2_real
             tp_tiers.append({
                 "fraction": tier.get("fraction", 0.5),
                 "price":    price,
@@ -234,8 +248,8 @@ class PositionManager:
             notional            = notional,
             stop_loss           = signal.stop_loss,
             hard_sl_price       = signal.hard_sl_price,
-            take_profit_1       = signal.take_profit_1,
-            take_profit_2       = signal.take_profit_2,
+            take_profit_1       = tp1_real,
+            take_profit_2       = tp2_real,
             invalidation_level  = signal.invalidation_level,
             analysis_id         = analysis_id,
             trailing_pivot_bars = self._trailing_pivot_pre,
@@ -647,28 +661,45 @@ class PositionManager:
 
     async def _handle_htf_bias_flip(self, pos: Position, symbol: str):
         new_bias = self.smc.get_htf_bias(symbol)
-        if (pos.side == "BUY" and new_bias == "BEARISH") or \
-           (pos.side == "SELL" and new_bias == "BULLISH"):
-            await self.tg.alert(
-                f"⚠️ HTF 偏向翻轉為 {new_bias}，持倉方向衝突！已提前出場",
-                level="WARNING",
-            )
-            pos.state = PositionState.CLOSING
-            self._create_task(
-                self._execute_close(
-                    pos, "HTF_FLIP", pos.entry_price,
-                    extra_factory=lambda fill: (
-                        f"HTF 翻轉出場　持倉 {pos.hold_duration_str()}\n"
-                        f"出場：${fill:,.0f}　損益：${pos.last_pnl:+,.0f}"
-                    ),
-                    rollback_state=PositionState.OPEN,
-                )
-            )
-        else:
+        conflict = (pos.side == "BUY" and new_bias == "BEARISH") or \
+                   (pos.side == "SELL" and new_bias == "BULLISH")
+
+        if not conflict:
             await self.tg.alert(
                 f"ℹ️ HTF 偏向翻轉為 {new_bias}，持倉方向一致，繼續持有",
                 level="INFO",
             )
+            return
+
+        # P1-8: TRAILING 態（已過 TP1，TP1 獲利已鎖）→ 縮緊 trailing pivot 而非強平
+        # 理由：HTF flip 當下通常已接近頭部，強平等於捐出 runner 收益
+        if pos.state == PositionState.TRAILING:
+            pos.trailing_pivot_bars = 1
+            pos._candle_buffer.clear()
+            self.tg.mark_state_changed("SL_MOVED")
+            await self.tg.alert(
+                f"⚠️ HTF 偏向翻轉 {new_bias}，Runner 保留但 trailing 縮緊為 1 pivot\n"
+                f"（TP1 已鎖利 +${pos.realized_pnl:,.0f}，讓 trailing 自然處理）",
+                level="WARNING",
+            )
+            return
+
+        # OPEN 態（未達 TP1，尚未鎖利）→ 立即出場
+        await self.tg.alert(
+            f"⚠️ HTF 偏向翻轉為 {new_bias}，持倉方向衝突且未達 TP1，提前出場",
+            level="WARNING",
+        )
+        pos.state = PositionState.CLOSING
+        self._create_task(
+            self._execute_close(
+                pos, "HTF_FLIP", pos.entry_price,
+                extra_factory=lambda fill: (
+                    f"HTF 翻轉出場　持倉 {pos.hold_duration_str()}\n"
+                    f"出場：${fill:,.0f}　損益：${pos.last_pnl:+,.0f}"
+                ),
+                rollback_state=PositionState.OPEN,
+            )
+        )
 
     # ── BE-C3 FIX: Task Management ────────────────────────────────────────────
 
