@@ -10,6 +10,13 @@ class BreakerState(Enum):
     HALF   = "HALF"
 
 
+# 純機械性風險出場（不論 pnl 正負都視為風險事件；實際勝負由 pnl 決定）
+_MECHANICAL_EXIT_REASONS = {"SL", "INVALIDATED", "TRAILING_SL", "HARD_SL", "HTF_FLIP"}
+
+# 中性事件（不影響連虧計數）
+_NEUTRAL_REASONS = {"MANUAL_CLOSE", "MAX_HOLD", "SERVER_STOP_TRIGGERED"}
+
+
 class CircuitBreaker:
     def __init__(self, db=None, tg=None):
         self.db          = db
@@ -23,6 +30,15 @@ class CircuitBreaker:
     async def load_state(self, db):
         """啟動時從 DB 恢復熔斷器狀態"""
         self.db = db
+
+        if os.getenv("RESET_CIRCUIT_BREAKER", "false").lower() == "true":
+            self.state       = BreakerState.CLOSED
+            self.loss_streak = 0
+            self.opened_at   = None
+            await self._persist(db)
+            print("[CB] RESET_CIRCUIT_BREAKER=true → state forced to CLOSED")
+            return
+
         row = await db.get_circuit_breaker_state()
         if row:
             self.state       = BreakerState[row["state"]]
@@ -31,7 +47,6 @@ class CircuitBreaker:
             if opened_at_str:
                 try:
                     dt = datetime.fromisoformat(opened_at_str)
-                    # 確保時區一致性
                     if dt.tzinfo is None:
                         dt = dt.replace(tzinfo=timezone.utc)
                     self.opened_at = dt
@@ -40,35 +55,48 @@ class CircuitBreaker:
             else:
                 self.opened_at = None
 
-            if self.state == BreakerState.OPEN and self.opened_at:
-                elapsed_h = (datetime.now(timezone.utc) - self.opened_at).total_seconds() / 3600
-                if elapsed_h >= self.pause_hours:
-                    self.state = BreakerState.HALF
-                    await self._persist(db)
+            await self.check_auto_recovery()
 
         print(
             f"Circuit breaker state restored: {self.state.value} "
             f"(streak: {self.loss_streak})"
         )
 
+    async def check_auto_recovery(self):
+        """
+        OPEN 經過 pause_hours 後自動 → HALF。
+        可在 load_state 或 heartbeat loop 週期呼叫，長時間運行也能恢復。
+        """
+        if self.state != BreakerState.OPEN or not self.opened_at:
+            return
+        elapsed_h = (datetime.now(timezone.utc) - self.opened_at).total_seconds() / 3600
+        if elapsed_h >= self.pause_hours:
+            self.state = BreakerState.HALF
+            if self.db:
+                await self._persist(self.db)
+            if self.tg:
+                await self.tg.notify_circuit_breaker("HALF", self.loss_streak)
+
     def is_open(self) -> bool:
         """OPEN 態拒絕新訊號；HALF 態允許試單"""
         return self.state == BreakerState.OPEN
 
-    async def record(self, close_reason: str):
+    async def record(self, close_reason: str, pnl: float = 0.0):
         """
-        R1 FIX: 改為 async，直接 await 持久化，避免裸 create_task 被 GC 回收。
-        R4/R9 FIX: MANUAL_CLOSE / MAX_HOLD 為中性事件，不影響熔斷器狀態。
+        以 pnl 正負判斷勝負，不再純靠 reason 字串。
+        - pnl < 0 → 連虧累加
+        - pnl >= 0（包含 TRAILING_SL 但 TP1 已先鎖利情況）→ 清零連虧
+        - 中性事件（MANUAL_CLOSE / MAX_HOLD / SERVER_STOP_TRIGGERED）不影響
 
-        HALF 態試單失敗時，重置 loss_streak = 1（記錄本次失敗），
-        而非延用舊值，避免「永遠無法恢復」的狀態鎖。
+        HALF 態下任何虧損立即回到 OPEN，loss_streak 重置為 1 避免鎖死。
         """
-        # R4/R9: 中性出場 — 不影響連虧計數與熔斷器狀態
-        if close_reason in ("MANUAL_CLOSE", "MAX_HOLD"):
+        if close_reason in _NEUTRAL_REASONS:
             await self._persist_with_fallback()
             return
 
-        if close_reason in ("SL", "INVALIDATED", "TRAILING_SL", "HARD_SL"):
+        is_loss = pnl < 0
+
+        if is_loss:
             if self.state == BreakerState.HALF:
                 self.state       = BreakerState.OPEN
                 self.opened_at   = datetime.now(timezone.utc)
@@ -81,10 +109,18 @@ class CircuitBreaker:
         else:
             self.loss_streak = 0
             if self.state == BreakerState.HALF:
-                self.state = BreakerState.CLOSED
+                self.state     = BreakerState.CLOSED
+                self.opened_at = None
 
-        # R1 FIX: await 取代裸 create_task，確保 DB 持久化完成
         await self._persist_with_fallback()
+
+    async def reset(self):
+        """手動重置（供管理端呼叫）"""
+        self.state       = BreakerState.CLOSED
+        self.loss_streak = 0
+        self.opened_at   = None
+        if self.db:
+            await self._persist(self.db)
 
     async def _persist(self, db):
         await db.save_circuit_breaker_state(
@@ -92,16 +128,14 @@ class CircuitBreaker:
         )
 
     async def _persist_with_fallback(self):
-        """
-        DB 寫入失敗：強制 OPEN 以最保守姿態運行。
-        """
+        """DB 寫入失敗：強制 OPEN 以最保守姿態運行。"""
         try:
             await self._persist(self.db)
         except Exception as e:
             self.state = BreakerState.OPEN
             if self.tg:
                 await self.tg.alert(
-                    f"🔴 熔斷器 DB 持久化失敗：{e}\n已強制切換為 OPEN 狀態",
+                    f"熔斷器 DB 持久化失敗：{e}\n已強制切換為 OPEN 狀態",
                     level="CRITICAL",
                 )
 

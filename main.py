@@ -121,12 +121,22 @@ class TradingSystem:
         self.circuit.db = self.db
         self.circuit.tg = self.tg
 
+        # 啟動時從 DB 恢復每日/每週 PnL（跨重啟保護風控上限）
+        try:
+            await self.risk.load_state(self.db)
+        except Exception as e:
+            print(f"[BOOT] risk state load failed: {e}")
+
         await self._refresh_equity()
         await self.executor.scan_orphan_orders_on_startup()
 
         is_paper = os.getenv("ALPACA_PAPER_MODE", "true").lower() == "true"
         await self.tg.notify_startup(
-            self.circuit.state, mode="PAPER" if is_paper else "LIVE"
+            self.circuit.state,
+            mode         = "PAPER" if is_paper else "LIVE",
+            loss_streak  = self.circuit.loss_streak,
+            auto_trade   = self.risk.is_auto_trade_enabled(),
+            market_order = self.risk.is_market_order_mode(),
         )
 
         await self._seed_historical_bars()
@@ -184,11 +194,12 @@ class TradingSystem:
             print(f"[BOOT] Volume check OK: {os.path.dirname(db_path)} is mounted")
 
     async def _seed_historical_bars(self):
-        """系統啟動時用歷史 K 棒初始化 SMC 結構"""
+        """系統啟動時用歷史 K 棒初始化 SMC 結構。
+        改用 Alpaca 原生 H4 timeframe，避免 H1 chunk 聚合時 UTC 邊界漂移。"""
         try:
             from alpaca.data.historical import CryptoHistoricalDataClient
             from alpaca.data.requests import CryptoBarsRequest
-            from alpaca.data.timeframe import TimeFrame
+            from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
             from datetime import timedelta
 
             hist_client = CryptoHistoricalDataClient(
@@ -209,40 +220,44 @@ class TradingSystem:
                     })
                 return result
 
-            # Seed H1 / H4
-            req_h1  = CryptoBarsRequest(
+            loop = asyncio.get_running_loop()
+
+            # H4 native（UTC 00/04/08/12/16/20 對齊）
+            req_h4 = CryptoBarsRequest(
+                symbol_or_symbols = "BTC/USD",
+                timeframe         = TimeFrame(4, TimeFrameUnit.Hour),
+                start             = datetime.now(timezone.utc) - timedelta(days=60),
+                limit             = 400,
+            )
+            bars_h4 = await loop.run_in_executor(None, hist_client.get_crypto_bars, req_h4)
+            df_h4   = bars_h4.df
+            if not df_h4.empty:
+                h4_bars = bars_to_dicts(df_h4)
+                self.smc.seed_bars("BTC/USD", "H4", h4_bars[-200:])
+                print(f"Seeded H4: {len(h4_bars)} bars (native 4h)")
+
+            # H1
+            req_h1 = CryptoBarsRequest(
                 symbol_or_symbols = "BTC/USD",
                 timeframe         = TimeFrame.Hour,
-                start             = datetime.now(timezone.utc) - timedelta(days=60),
-                limit             = 1500,
+                start             = datetime.now(timezone.utc) - timedelta(days=20),
+                limit             = 500,
             )
-            bars_h1 = hist_client.get_crypto_bars(req_h1)
+            bars_h1 = await loop.run_in_executor(None, hist_client.get_crypto_bars, req_h1)
             df_h1   = bars_h1.df
             if not df_h1.empty:
-                hourly  = bars_to_dicts(df_h1)
-                h4_bars = []
-                for i in range(0, len(hourly) - 3, 4):
-                    chunk = hourly[i:i + 4]
-                    h4_bars.append({
-                        "open":      chunk[0]["open"],
-                        "high":      max(b["high"] for b in chunk),
-                        "low":       min(b["low"]  for b in chunk),
-                        "close":     chunk[-1]["close"],
-                        "volume":    sum(b["volume"] for b in chunk),
-                        "timestamp": chunk[-1]["timestamp"],
-                    })
-                self.smc.seed_bars("BTC/USD", "H4", h4_bars[-200:])
-                self.smc.seed_bars("BTC/USD", "H1", hourly[-200:])
-                print(f"Seeded H4: {len(h4_bars)} bars, H1: {len(hourly)} bars")
+                h1_bars = bars_to_dicts(df_h1)
+                self.smc.seed_bars("BTC/USD", "H1", h1_bars[-200:])
+                print(f"Seeded H1: {len(h1_bars)} bars")
 
-            # Seed M1
-            req_m1  = CryptoBarsRequest(
+            # M1
+            req_m1 = CryptoBarsRequest(
                 symbol_or_symbols = "BTC/USD",
                 timeframe         = TimeFrame.Minute,
                 start             = datetime.now(timezone.utc) - timedelta(hours=4),
                 limit             = 240,
             )
-            bars_m1 = hist_client.get_crypto_bars(req_m1)
+            bars_m1 = await loop.run_in_executor(None, hist_client.get_crypto_bars, req_m1)
             df_m1   = bars_m1.df
             if not df_m1.empty:
                 m1_bars = bars_to_dicts(df_m1)
@@ -277,14 +292,15 @@ class TradingSystem:
         if self._paused:
             return
 
-        # B-3 FIX: 每日損失超限時暫停下單
         if self.risk.is_daily_loss_exceeded():
-            await self.tg.alert("🔴 每日最大虧損上限已觸及，今日暫停新倉", level="WARNING")
+            await self.tg.alert("每日最大虧損上限已觸及，今日暫停新倉", level="WARNING")
+            # 現有持倉一併強制平倉，避免虧損繼續擴大
+            await self._force_close_all("DAILY_LOSS_LIMIT")
             return
 
-        # AT-H5 FIX: 每週損失超限
         if self.risk.is_weekly_loss_exceeded():
-            await self.tg.alert("🔴 本週最大虧損上限已觸及，本週暫停新倉", level="WARNING")
+            await self.tg.alert("本週最大虧損上限已觸及，本週暫停新倉", level="WARNING")
+            await self._force_close_all("WEEKLY_LOSS_LIMIT")
             return
 
         # T-8 FIX: RRR 最低門檻過濾
@@ -377,6 +393,22 @@ class TradingSystem:
         except Exception as e:
             await self.tg.alert(f"⚠️ Slow Track 記錄失敗：{e}", level="WARNING")
 
+    async def _force_close_all(self, reason: str):
+        """風控上限觸發時強制平倉所有持倉（MANUAL_CLOSE reason 不計入熔斷器）"""
+        if not self.position_mgr.has_open_positions():
+            return
+        for symbol, pos in list(self.position_mgr.positions.items()):
+            try:
+                await self.position_mgr._execute_close(
+                    pos, "MANUAL_CLOSE", pos.entry_price,
+                    extra_factory=lambda fill, r=reason: f"風控觸發強制平倉：{r}",
+                    rollback_state=pos.state,
+                )
+            except Exception as e:
+                await self.tg.alert(
+                    f"風控強制平倉失敗（{symbol}）：{e}", level="CRITICAL"
+                )
+
     # ── Position Close Callback ───────────────────────────────────────────────
 
     async def _on_position_close(self, pos, reason):
@@ -399,10 +431,16 @@ class TradingSystem:
             now   = asyncio.get_running_loop().time()
             force = (now - last_forced) >= 14400
 
+            # 熔斷器 OPEN 到期自動轉 HALF（長時間運行也能恢復）
+            try:
+                await self.circuit.check_auto_recovery()
+            except Exception:
+                pass
+
             snapshot = self._build_snapshot()
             if force or self.tg.has_meaningful_state_change(snapshot):
                 await self.tg.notify_heartbeat(snapshot)
-                self.smc.reset_signal_stats()  # 重置訊號統計
+                self.smc.reset_signal_stats()
                 if force:
                     last_forced = now
 
@@ -554,8 +592,7 @@ class TradingSystem:
             loop.add_signal_handler(sig, lambda s=sig: _handle_shutdown(s.name))
 
     async def _graceful_shutdown(self):
-        await self.tg.alert("🔴 Trading System 正在關閉（SIGTERM）", level="WARNING")
-        # 取消所有背景 tasks
+        await self.tg.alert("Trading System 正在關閉（SIGTERM）", level="WARNING")
         for task in list(self._background_tasks):
             task.cancel()
         try:
@@ -567,7 +604,15 @@ class TradingSystem:
         except Exception:
             pass
         try:
+            await self.risk._persist()
+        except Exception:
+            pass
+        try:
             await self.db.close()
+        except Exception:
+            pass
+        try:
+            await self.tg.shutdown()
         except Exception:
             pass
         print("[SHUTDOWN] 完成，退出")

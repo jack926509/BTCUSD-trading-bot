@@ -57,13 +57,16 @@ CREATE TABLE IF NOT EXISTS circuit_breaker_state (
     updated_at  TEXT    NOT NULL
 );
 
+-- pending_orders.status: PENDING / FILLED / DISMISSED
+-- confirmed 欄位保留（向後相容），但新程式邏輯以 status 為準
 CREATE TABLE IF NOT EXISTS pending_orders (
     order_id      TEXT    PRIMARY KEY,
     side          TEXT,
     notional_usd  REAL,
     submitted_at  TEXT    NOT NULL,
     confirmed     INTEGER DEFAULT 0,
-    confirmed_at  TEXT
+    confirmed_at  TEXT,
+    status        TEXT    DEFAULT 'PENDING'
 );
 
 CREATE TABLE IF NOT EXISTS system_log (
@@ -72,4 +75,13 @@ CREATE TABLE IF NOT EXISTS system_log (
     event_type  TEXT,
     message     TEXT,
     resolved    INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS risk_state (
+    id           INTEGER PRIMARY KEY DEFAULT 1,
+    daily_pnl    REAL    DEFAULT 0,
+    daily_date   TEXT,
+    weekly_pnl   REAL    DEFAULT 0,
+    weekly_iso   TEXT,
+    updated_at   TEXT
 );

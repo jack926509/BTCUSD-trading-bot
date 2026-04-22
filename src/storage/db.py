@@ -36,6 +36,17 @@ class Database:
         # BE-C4: 自動 schema migration（冪等 CREATE IF NOT EXISTS）
         with open(_SCHEMA_PATH, "r") as f:
             await self._conn.executescript(f.read())
+        # 舊版 DB 可能沒有 pending_orders.status 欄位 → 手動補上
+        cur = await self._conn.execute("PRAGMA table_info(pending_orders)")
+        cols = {row[1] for row in await cur.fetchall()}
+        if "status" not in cols:
+            await self._conn.execute(
+                "ALTER TABLE pending_orders ADD COLUMN status TEXT DEFAULT 'PENDING'"
+            )
+            await self._conn.execute(
+                "UPDATE pending_orders SET status='FILLED' WHERE confirmed=1"
+            )
+            await self._conn.commit()
 
     async def close(self):
         if self._conn:
@@ -103,28 +114,47 @@ class Database:
     async def record_pending_order(self, order_id: str, side: str, notional: float):
         await self._execute(
             """INSERT OR IGNORE INTO pending_orders
-               (order_id, side, notional_usd, submitted_at)
-               VALUES (?, ?, ?, ?)""",
+               (order_id, side, notional_usd, submitted_at, status)
+               VALUES (?, ?, ?, ?, 'PENDING')""",
             (order_id, side, notional, _now()),
         )
 
     async def get_unconfirmed_orders(self) -> list:
+        """Startup 需重掃的訂單（仍為 PENDING 狀態；FILLED / DISMISSED 都跳過）"""
         rows = await self._fetchall(
-            "SELECT order_id FROM pending_orders WHERE confirmed=0"
+            "SELECT order_id FROM pending_orders WHERE status='PENDING'"
         )
         return [r["order_id"] for r in rows]
 
     async def confirm_order_filled(self, order_id: str):
         await self._execute(
-            "UPDATE pending_orders SET confirmed=1, confirmed_at=? WHERE order_id=?",
+            """UPDATE pending_orders
+               SET confirmed=1, confirmed_at=?, status='FILLED'
+               WHERE order_id=?""",
             (_now(), order_id),
         )
 
     async def dismiss_pending_order(self, order_id: str):
-        """Mark a cancelled/expired order as handled so startup scan ignores it."""
+        """取消/超時訂單：與 FILLED 區隔，保留審計軌跡，startup 掃描不再重處理"""
         await self._execute(
-            "UPDATE pending_orders SET confirmed=1, confirmed_at=? WHERE order_id=?",
+            """UPDATE pending_orders
+               SET confirmed_at=?, status='DISMISSED'
+               WHERE order_id=?""",
             (_now(), order_id),
+        )
+
+    # ── Risk State Persistence ───────────────────────────────────────────────
+
+    async def load_risk_state(self) -> dict:
+        return await self._fetchone("SELECT * FROM risk_state WHERE id=1") or {}
+
+    async def save_risk_state(self, daily_pnl: float, daily_date: str,
+                              weekly_pnl: float, weekly_iso: str):
+        await self._execute(
+            """INSERT OR REPLACE INTO risk_state
+               (id, daily_pnl, daily_date, weekly_pnl, weekly_iso, updated_at)
+               VALUES (1, ?, ?, ?, ?, ?)""",
+            (daily_pnl, daily_date, weekly_pnl, weekly_iso, _now()),
         )
 
     # ── Analysis Log ──────────────────────────────────────────────────────────
@@ -212,6 +242,27 @@ class Database:
             )
             await self._conn.commit()
             return cur.lastrowid
+
+    async def update_trade_stop_loss(self, trade_id: int, stop_loss: float,
+                                      hard_sl_price: float,
+                                      server_stop_order_id: str = None):
+        """Trailing SL 移動時同步更新 DB（保留審計軌跡）"""
+        await self._execute(
+            """UPDATE trade_log
+               SET stop_loss=?, hard_sl_price=?,
+                   server_stop_order_id=COALESCE(?, server_stop_order_id)
+               WHERE id=?""",
+            (stop_loss, hard_sl_price, server_stop_order_id, trade_id),
+        )
+
+    async def find_recent_open_trade(self, symbol: str) -> dict:
+        """Reconcile 接管孤兒持倉時，回頭找最近未關閉的 trade_log 還原 SL/TP"""
+        return await self._fetchone(
+            """SELECT * FROM trade_log
+               WHERE symbol=? AND close_time IS NULL
+               ORDER BY id DESC LIMIT 1""",
+            (symbol,),
+        )
 
     async def close_trade(
         self,

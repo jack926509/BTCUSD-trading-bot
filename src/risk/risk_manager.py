@@ -127,5 +127,18 @@ class RiskManager:
     def get_limit_order_timeout(self) -> int:
         return self._cfg.get("btcusd", {}).get("limit_order_timeout_seconds", 300)
 
+    def get_spread_filter_pct(self) -> float:
+        return self._cfg.get("btcusd", {}).get("spread_filter_pct", 0.001)
+
     def get_circuit_breaker_config(self) -> dict:
         return self._cfg.get("circuit_breaker", {})
+
+    # ── Snapshot ──────────────────────────────────────────────────────────────
+
+    def snapshot(self) -> dict:
+        self._check_date_rollover()
+        return {
+            "daily_pnl":  self._daily_pnl,
+            "weekly_pnl": self._weekly_pnl,
+            "equity":     self._account_equity or 0.0,
+        }

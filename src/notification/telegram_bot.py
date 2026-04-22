@@ -7,14 +7,19 @@ TG-M2 FIX: heartbeat 加入 TradingView 連結
 TG-M3 FIX: 出場通知加入持倉時間
 """
 import asyncio
+import html
 import os
 from datetime import datetime, timezone
 from typing import Optional
 
-from telegram import Bot, Update
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import RetryAfter, TimedOut, NetworkError
 from telegram.ext import Application, CommandHandler, ContextTypes
+
+
+# Telegram 4096-char 上限；預留 safety 餘裕
+_TG_MAX_LEN = 3900
 
 
 # ── Formatting Helpers ───────────────────────────────────────────────────────
@@ -30,7 +35,32 @@ def _pct(diff: float, base: float) -> str:
     return f"{sign}{p:.2f}%"
 
 def _now_utc() -> str:
-    return datetime.now(timezone.utc).strftime("%m/%d %H:%M UTC")
+    """依 TZ env 顯示本地時間（預設 UTC）"""
+    tz_name = os.getenv("TZ", "UTC").strip()
+    now = datetime.now(timezone.utc)
+    suffix = "UTC"
+    if tz_name and tz_name != "UTC":
+        try:
+            import zoneinfo
+            tz = zoneinfo.ZoneInfo(tz_name)
+            now = now.astimezone(tz)
+            suffix = tz_name
+        except Exception:
+            pass
+    return now.strftime(f"%m/%d %H:%M {suffix}")
+
+
+def _esc(s) -> str:
+    """HTML-escape 任意值；None / numeric 也能處理"""
+    if s is None:
+        return ""
+    return html.escape(str(s), quote=False)
+
+
+def _truncate(text: str) -> str:
+    if len(text) <= _TG_MAX_LEN:
+        return text
+    return text[:_TG_MAX_LEN - 1] + "…"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -79,8 +109,9 @@ class TelegramNotifier:
 
     # ── Rate-Limited Send (TG-H3) ─────────────────────────────────────────────
 
-    async def _send(self, text: str, retries: int = 3):
-        """TG-H3 FIX: 訊息發送 + RetryAfter 退避重試"""
+    async def _send(self, text: str, retries: int = 3, reply_markup=None):
+        """訊息發送 + RetryAfter 退避重試 + 4096 字截斷"""
+        text = _truncate(text)
         if not self._bot or not self._chat_id:
             print(f"[TG] {text[:200]}")
             return
@@ -92,10 +123,10 @@ class TelegramNotifier:
                     text       = text,
                     parse_mode = ParseMode.HTML,
                     disable_web_page_preview = True,
+                    reply_markup = reply_markup,
                 )
                 return
             except RetryAfter as e:
-                # Telegram 主動告知需等待多久
                 wait = e.retry_after + 1
                 print(f"[TG] rate-limited, sleeping {wait}s")
                 await asyncio.sleep(wait)
@@ -105,29 +136,70 @@ class TelegramNotifier:
                 await asyncio.sleep(wait)
             except Exception as e:
                 print(f"[TG] send error: {e!r}")
-                return  # 非重試類錯誤，直接放棄
+                return
+
+    def _dashboard_button(self) -> Optional[InlineKeyboardMarkup]:
+        url = os.getenv("ALPACA_DASHBOARD_URL", "").strip()
+        if not url:
+            return None
+        return InlineKeyboardMarkup([[
+            InlineKeyboardButton("Alpaca Dashboard", url=url)
+        ]])
 
     async def alert(self, message: str, level: str = "INFO"):
         icons = {"CRITICAL": "🔴", "WARNING": "⚠️", "INFO": "ℹ️"}
         icon  = icons.get(level, "")
-        await self._send(f"{icon} {message}")
+        # escape 動態訊息；防止 exception 字串含 < > & 破壞 HTML 解析
+        await self._send(f"{icon} {_esc(message)}")
+
+    async def shutdown(self):
+        """graceful shutdown 時呼叫：關閉 httpx client + polling application"""
+        try:
+            if self._app is not None:
+                await self._app.updater.stop()
+                await self._app.stop()
+                await self._app.shutdown()
+        except Exception:
+            pass
+        try:
+            if self._bot is not None and self._app is None:
+                await self._bot.shutdown()
+        except Exception:
+            pass
 
     # ── Startup Notification ──────────────────────────────────────────────────
 
-    async def notify_startup(self, circuit_state, mode: str = "PAPER"):
+    async def notify_startup(
+        self, circuit_state, mode: str = "PAPER",
+        loss_streak: int = 0, auto_trade: bool = True,
+        market_order: bool = False,
+    ):
         state_val = circuit_state.value if hasattr(circuit_state, "value") else str(circuit_state)
         mode_icon = "🧪" if mode == "PAPER" else "🔴"
         cb_icon   = {"CLOSED": "🟢", "HALF": "🟡", "OPEN": "🔴"}.get(state_val, "⚪")
-        text = (
-            f"🚀 <b>Trading System v7.1 啟動</b>\n"
-            f"{'─' * 22}\n"
-            f"{mode_icon} 模式　<b>{mode}</b>\n"
-            f"{cb_icon} 熔斷器　{state_val}\n"
-            f"📡 WebSocket　連線中…\n"
-            f"⏰ {_now_utc()}\n"
-            f"\n💬 可用命令：/status /pause /resume /close /pnl /signals"
-        )
-        await self._send(text)
+
+        flags = []
+        if not auto_trade:
+            flags.append("🚫 <b>auto_trade = false（僅記錄訊號，不下單）</b>")
+        if market_order:
+            flags.append("⚠️ <b>use_market_order = true（測試模式：市價打，略過 OB/FVG 回踩）</b>")
+
+        lines = [
+            "🚀 <b>Trading System v7.1 啟動</b>",
+            "─" * 22,
+            f"{mode_icon} 模式　<b>{_esc(mode)}</b>",
+            f"{cb_icon} 熔斷器　{_esc(state_val)}　連虧 {loss_streak}",
+            "📡 WebSocket　連線中…",
+        ]
+        if flags:
+            lines.append("─" * 22)
+            lines.extend(flags)
+        lines += [
+            f"⏰ {_now_utc()}",
+            "",
+            "💬 可用命令：/status /pause /resume /close /pnl /signals",
+        ]
+        await self._send("\n".join(lines), reply_markup=self._dashboard_button())
 
     # ── Trade Open Notification ───────────────────────────────────────────────
 
@@ -161,10 +233,10 @@ class TelegramNotifier:
             zone_line += f"🕳  FVG　{fvg_range}\n"
 
         text = (
-            f"📊 <b>開倉 · {symbol} {side_str}</b>\n"
+            f"📊 <b>開倉 · {_esc(symbol)} {side_str}</b>\n"
             f"{'─' * 24}\n"
             f"⏰ {_now_utc()}\n"
-            f"{bias_icon} HTF　{htf_bias}　｜　{src_label}\n"
+            f"{bias_icon} HTF　{_esc(htf_bias)}　｜　{_esc(src_label)}\n"
             f"{'─' * 24}\n"
             f"💰 進場限價　<b>${entry:,.0f}</b>\n"
             f"🎯 TP1　${tp1:,.0f}　<i>({_pct(tp1_usd, entry)}  +${tp1_usd:,.0f})</i>\n"
@@ -175,9 +247,9 @@ class TelegramNotifier:
             f"📐 RRR　1 : {rrr:.2f}　｜　風險 ${risk_usd:,.0f}\n"
             f"🔒 失效　收盤穿越 ${inval:,.0f}\n"
             + (f"{'─' * 24}\n{zone_line}" if zone_line else "")
-            + (f"<i>{description}</i>" if description else "")
+            + (f"<i>{_esc(description)}</i>" if description else "")
         )
-        await self._send(text)
+        await self._send(text, reply_markup=self._dashboard_button())
 
     # ── TP1 Notification ──────────────────────────────────────────────────────
 
@@ -202,7 +274,7 @@ class TelegramNotifier:
 
     # ── Close Notification ────────────────────────────────────────────────────
 
-    async def notify_close(self, pos, reason: str, extra: str = ""):
+    async def notify_close(self, pos, reason: str, fill_price: float = None, extra: str = ""):
         side_str = "LONG 🔺" if pos.side == "BUY" else "SHORT 🔻"
         symbol   = getattr(pos, "symbol", "BTC/USD")
         pnl      = getattr(pos, "last_pnl", 0) or 0
@@ -221,17 +293,20 @@ class TelegramNotifier:
             "MAX_HOLD":             ("⏰", "超時強制出場"),
             "MANUAL_CLOSE":         ("🔧", "手動平倉"),
         }
-        icon, label = headers.get(reason, ("🚪", f"出場 ({reason})"))
+        icon, label = headers.get(reason, ("🚪", f"出場 ({_esc(reason)})"))
 
         pnl_icon = "🟢" if pnl >= 0 else "🔴"
         tot_icon = "🟢" if total >= 0 else "🔴"
 
         lines = [
-            f"{icon} <b>{label} · {symbol} {side_str}</b>",
+            f"{icon} <b>{_esc(label)} · {_esc(symbol)} {side_str}</b>",
             f"{'─' * 24}",
             f"💰 進場　${pos.entry_price:,.0f}",
-            f"{pnl_icon} 本次損益　<b>{_pnl(pnl)}</b>",
         ]
+        if fill_price:
+            slip = abs(fill_price - pos.entry_price) / pos.entry_price * 100 if pos.entry_price else 0
+            lines.append(f"🚪 出場　${fill_price:,.0f}　<i>滑點 {slip:.2f}%</i>")
+        lines.append(f"{pnl_icon} 本次損益　<b>{_pnl(pnl)}</b>")
 
         if realized:
             lines.append(
@@ -242,7 +317,9 @@ class TelegramNotifier:
             lines.append(f"⏱ 持倉時間　{hold_str}")
 
         if extra:
-            lines += [f"{'─' * 24}", extra]
+            # extra 內可能含 <b> 等已格式化標籤；若不含 < 就當純文字 escape
+            safe_extra = extra if "<" in extra else _esc(extra)
+            lines += [f"{'─' * 24}", safe_extra]
 
         lines.append(f"⏰ {_now_utc()}")
         await self._send("\n".join(lines))
@@ -346,11 +423,9 @@ class TelegramNotifier:
             f"⏳ {delay}s 後重連…\n"
         )
         if pos_snapshot and pos_snapshot != "無持倉":
-            text += f"{'─' * 24}\n📍 持倉快照\n{pos_snapshot}\n"
-        dashboard = os.getenv("ALPACA_DASHBOARD_URL", "")
-        if dashboard:
-            text += f"{'─' * 24}\n🔗 {dashboard}"
-        await self._send(text)
+            safe_snap = pos_snapshot if "<" in pos_snapshot else _esc(pos_snapshot)
+            text += f"{'─' * 24}\n📍 持倉快照\n{safe_snap}\n"
+        await self._send(text, reply_markup=self._dashboard_button())
 
     # ── TG-C1: Bidirectional Commands ─────────────────────────────────────────
 

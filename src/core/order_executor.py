@@ -40,6 +40,25 @@ class OrderExecutor:
         self.tg                   = tg
         self._limit_order_timeout = limit_order_timeout
 
+    # ── Sync-to-async helpers ─────────────────────────────────────────────────
+    # alpaca-py 的 REST method 是同步的；直接在 async 函式內呼叫會阻塞 event
+    # loop。以下 helper 統一把它們丟進執行緒池，避免撞到 WebSocket 處理。
+
+    async def _submit(self, request):
+        return await asyncio.to_thread(self.client.submit_order, request)
+
+    async def _get_order(self, order_id: str):
+        return await asyncio.to_thread(self.client.get_order_by_id, order_id)
+
+    async def _cancel_order(self, order_id: str):
+        return await asyncio.to_thread(self.client.cancel_order_by_id, order_id)
+
+    async def _close_symbol(self, symbol: str):
+        return await asyncio.to_thread(self.client.close_position, symbol)
+
+    async def get_account_async(self):
+        return await asyncio.to_thread(self.client.get_account)
+
     # ── Fill Detection (REST Polling) ─────────────────────────────────────────
 
     async def on_trade_update(self, update):
@@ -64,7 +83,7 @@ class OrderExecutor:
             idx += 1
 
             try:
-                order = self.client.get_order_by_id(order_id)
+                order = await self._get_order(order_id)
             except Exception as e:
                 print(f"[WARN] get_order_by_id({order_id}): {e}")
                 continue
@@ -94,14 +113,13 @@ class OrderExecutor:
         order = None
         for attempt in range(3):
             try:
-                order  = self.client.submit_order(req)
+                order  = await self._submit(req)
                 await self.db.record_pending_order(str(order.id), side, notional)
                 result = await self._wait_fill_event(
                     str(order.id), timeout=30,
                     poll_intervals=_MARKET_POLL_INTERVALS,
                 )
 
-                # AT-C3 FIX: IOC 可能部分成交，確認 filled_qty > 0
                 filled_qty = float(getattr(result, "filled_qty", 0) or 0)
                 if filled_qty <= 0:
                     if order:
@@ -118,6 +136,8 @@ class OrderExecutor:
                 raise
             except Exception as e:
                 if attempt == 2:
+                    if order:
+                        await self.db.dismiss_pending_order(str(order.id))
                     raise OrderError(f"市價單失敗：{e}")
                 await asyncio.sleep(0.5 * (2 ** attempt))
 
@@ -157,7 +177,7 @@ class OrderExecutor:
         order = None
         for attempt in range(3):
             try:
-                order  = self.client.submit_order(req)
+                order  = await self._submit(req)
                 await self.db.record_pending_order(str(order.id), side, notional)
                 result = await self._wait_fill_event(str(order.id), timeout=self._limit_order_timeout)
                 await self.db.confirm_order_filled(str(order.id))
@@ -175,6 +195,8 @@ class OrderExecutor:
                 raise
             except Exception as e:
                 if attempt == 2:
+                    if order:
+                        await self.db.dismiss_pending_order(str(order.id))
                     raise OrderError(f"下單失敗：{e}")
                 await asyncio.sleep(0.5 * (2 ** attempt))
 
@@ -192,7 +214,7 @@ class OrderExecutor:
         order = None
         for attempt in range(3):
             try:
-                order  = self.client.submit_order(req)
+                order  = await self._submit(req)
                 await self.db.record_pending_order(str(order.id), "TP1_PARTIAL", 0)
                 result = await self._wait_fill_event(
                     str(order.id), timeout=15,
@@ -224,15 +246,16 @@ class OrderExecutor:
         server_stop_cancelled = False
         if hasattr(pos, "server_stop_order_id") and pos.server_stop_order_id:
             try:
-                self.client.cancel_order_by_id(pos.server_stop_order_id)
+                await self._cancel_order(pos.server_stop_order_id)
                 server_stop_cancelled = True
+                pos.server_stop_order_id = None
             except Exception:
                 pass
 
         close_order_id = None
         for attempt in range(3):
             try:
-                order          = self.client.close_position("BTC/USD")
+                order          = await self._close_symbol("BTC/USD")
                 close_order_id = str(order.id)
                 await self.db.record_pending_order(close_order_id, "CLOSE", 0)
                 result = await self._wait_fill_event(
@@ -276,8 +299,8 @@ class OrderExecutor:
         self, side: str, qty: float, hard_sl_price: float, buffer_pct: float = 0.005
     ) -> str:
         """
-        進場成交後立即呼叫。
-        Alpaca crypto 不支援純 Stop Order，改用 Stop-Limit。
+        進場成交後立即呼叫。Alpaca crypto 不支援純 Stop Order，用 Stop-Limit。
+        失敗重試 3 次，全部失敗回傳 None（上層可據此強制平倉）。
         """
         if side == "BUY":
             stop_price  = round(hard_sl_price * (1 - buffer_pct), 2)
@@ -296,12 +319,38 @@ class OrderExecutor:
             stop_price    = stop_price,
             limit_price   = limit_price,
         )
-        try:
-            order = self.client.submit_order(req)
-            return str(order.id)
-        except Exception as e:
-            await self.tg.alert(f"⚠️ 伺服器端停損單送出失敗：{e}", level="WARNING")
-            return None
+
+        for attempt in range(3):
+            try:
+                order = await self._submit(req)
+                return str(order.id)
+            except Exception as e:
+                print(f"[WARN] server-side stop attempt {attempt + 1}/3 failed: {e}")
+                if attempt == 2:
+                    await self.tg.alert(
+                        f"伺服器端停損單送出失敗（3 次重試後放棄）：{e}",
+                        level="CRITICAL",
+                    )
+                    return None
+                await asyncio.sleep(0.5 * (2 ** attempt))
+
+    async def replace_server_side_stop(
+        self, old_order_id: str, side: str, qty: float,
+        hard_sl_price: float, buffer_pct: float = 0.005,
+    ) -> str:
+        """
+        Trailing SL 上移時呼叫：cancel 舊 server stop，送新的。
+        cancel 失敗（可能已觸發）仍嘗試送新單。回傳新 order_id 或 None。
+        """
+        if old_order_id:
+            try:
+                await self._cancel_order(old_order_id)
+            except Exception as e:
+                print(f"[INFO] cancel old server stop {old_order_id} failed "
+                      f"(may have triggered): {e}")
+        return await self.place_server_side_stop(
+            side=side, qty=qty, hard_sl_price=hard_sl_price, buffer_pct=buffer_pct,
+        )
 
     # ── Ghost Order 防護 ──────────────────────────────────────────────────────
 
@@ -315,32 +364,36 @@ class OrderExecutor:
 
     async def _safe_cancel(self, order_id: str) -> bool:
         try:
-            self.client.cancel_order_by_id(order_id)
+            await self._cancel_order(order_id)
             await asyncio.sleep(0.5)
-            order = self.client.get_order_by_id(order_id)
+            order = await self._get_order(order_id)
             return order.status in (OrderStatus.CANCELED, OrderStatus.EXPIRED)
         except Exception:
             return False
 
     async def _verify_and_handle_order(self, order_id: str):
         try:
-            order = self.client.get_order_by_id(order_id)
+            order = await self._get_order(order_id)
             if order.status == OrderStatus.FILLED:
                 await self.tg.alert(
-                    f"⚠️ 訂單 {order_id} cancel 失敗但已成交，觸發 Reconciliation",
+                    f"訂單 {order_id} cancel 失敗但已成交，觸發 Reconciliation",
                     level="WARNING",
                 )
                 await self.position_mgr.reconcile_single(order)
+                await self.db.confirm_order_filled(order_id)
             elif order.status in (
                 OrderStatus.PARTIALLY_FILLED,
                 OrderStatus.PENDING_NEW,
                 OrderStatus.ACCEPTED,
             ):
                 await self.tg.alert(
-                    f"🔴 訂單 {order_id} 狀態不確定（{order.status}），請手動確認",
+                    f"訂單 {order_id} 狀態不確定（{order.status}），請手動確認",
                     level="CRITICAL",
                 )
+            else:
+                # CANCELED / EXPIRED / REJECTED — 明確標記，startup 掃描不重處理
+                await self.db.dismiss_pending_order(order_id)
         except Exception as e:
             await self.tg.alert(
-                f"🔴 訂單查詢失敗：{order_id} / {e}", level="CRITICAL"
+                f"訂單查詢失敗：{order_id} / {e}", level="CRITICAL"
             )

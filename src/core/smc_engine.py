@@ -329,17 +329,19 @@ class SMCEngine:
         highs = [b["high"] for b in recent]
         lows  = [b["low"]  for b in recent]
 
+        # O(n log n)：排序後只比較相鄰元素；tol 內視為相等
         levels = []
-        for i, h in enumerate(highs):
-            for j in range(i + 1, len(highs)):
-                if abs(highs[j] - h) <= tol:
-                    levels.append({"type": "EQH", "price": (h + highs[j]) / 2})
-                    break
-        for i, lo in enumerate(lows):
-            for j in range(i + 1, len(lows)):
-                if abs(lows[j] - lo) <= tol:
-                    levels.append({"type": "EQL", "price": (lo + lows[j]) / 2})
-                    break
+        seen   = set()
+        for arr, tag in ((highs, "EQH"), (lows, "EQL")):
+            sorted_arr = sorted(arr)
+            for i in range(len(sorted_arr) - 1):
+                a, b = sorted_arr[i], sorted_arr[i + 1]
+                if abs(b - a) <= tol:
+                    price = round((a + b) / 2, 2)
+                    key   = (tag, price)
+                    if key not in seen:
+                        seen.add(key)
+                        levels.append({"type": tag, "price": price})
 
         self._eqh_eql[symbol][tf] = levels
 
@@ -506,7 +508,7 @@ class SMCEngine:
         direction = "BUY" if sweep["direction"] == "BULLISH" else "SELL"
         price     = candle["close"]
 
-        ob, fvg   = self._find_ob_fvg(symbol, direction)
+        ob, fvg   = self._find_ob_fvg(symbol, direction, self.sweep_entry_model)
         entry, sl, tp1, tp2, inval = self._calc_levels(
             direction, price, ob, fvg, candle
         )
@@ -538,7 +540,8 @@ class SMCEngine:
         direction = "BUY" if "BULLISH" in ltf_trigger else "SELL"
         price     = candle["close"]
 
-        ob, fvg   = self._find_ob_fvg(symbol, direction)
+        entry_model = self.choch_entry_model if is_choch else self.bos_entry_model
+        ob, fvg   = self._find_ob_fvg(symbol, direction, entry_model)
         entry, sl, tp1, tp2, inval = self._calc_levels(
             direction, price, ob, fvg, candle
         )
@@ -569,7 +572,13 @@ class SMCEngine:
 
     # ── Level Calculations ───────────────────────────────────────────────────
 
-    def _find_ob_fvg(self, symbol: str, direction: str):
+    def _find_ob_fvg(self, symbol: str, direction: str, entry_model: str = "ob_fvg"):
+        """
+        依 config 的 entry_model 決定回踩參考：
+        - ob_fvg：OB 優先，OB 無則退 FVG（預設，BOS / SWEEP 用）
+        - fvg_only：只看 FVG，不看 OB（CHoCH 預設，要求更乾淨的回踩）
+        - ob_only：只看 OB
+        """
         obs  = self._order_blocks[symbol][self.ltf]
         fvgs = self._fvgs[symbol][self.ltf]
 
@@ -578,6 +587,11 @@ class SMCEngine:
 
         ob  = next((o for o in reversed(obs)  if o["type"] == ob_type), None)
         fvg = next((f for f in reversed(fvgs) if f["type"] == fvg_type and not f["filled"]), None)
+
+        if entry_model == "fvg_only":
+            return None, fvg
+        if entry_model == "ob_only":
+            return ob, None
         return ob, fvg
 
     def _calc_levels(self, direction: str, price: float,

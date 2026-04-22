@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Callable, Optional
 
-from src.config.loader import get_position_rules
+from src.config.loader import get_position_rules, get_risk_config
 
 
 class PositionState(Enum):
@@ -76,22 +76,30 @@ class Position:
 
     # ── Trailing Stop ─────────────────────────────────────────────────────────
 
-    def update_structural_trailing(self, candle: dict):
+    # Hard SL buffer（由 PositionManager 依 risk_config 注入）
+    hard_sl_buffer_pct: float = 0.003
+
+    def update_structural_trailing(self, candle: dict) -> bool:
+        """回傳 True 若 stop_loss 有變動（供上層決定要不要更新 server stop）"""
         swing = self._detect_swing(candle)
         if not swing:
-            return
+            return False
+        buf = self.hard_sl_buffer_pct
         if self.side == "BUY":
             candidate = swing["low"] - self.structural_buffer
             if (candidate > self.stop_loss and
                     (candidate - self.stop_loss) >= self.entry_price * self.min_trail_pct):
                 self.stop_loss     = candidate
-                self.hard_sl_price = round(candidate * (1 - 0.003), 2)
+                self.hard_sl_price = round(candidate * (1 - buf), 2)
+                return True
         elif self.side == "SELL":
             candidate = swing["high"] + self.structural_buffer
             if (candidate < self.stop_loss and
                     (self.stop_loss - candidate) >= self.entry_price * self.min_trail_pct):
                 self.stop_loss     = candidate
-                self.hard_sl_price = round(candidate * (1 + 0.003), 2)
+                self.hard_sl_price = round(candidate * (1 + buf), 2)
+                return True
+        return False
 
     def _detect_swing(self, latest_candle: dict) -> Optional[dict]:
         N = self.trailing_pivot_bars
@@ -134,6 +142,7 @@ class PositionManager:
         self.executor        = None      # set by TradingSystem after init
 
         rules = get_position_rules()
+        risk_cfg = get_risk_config()
 
         self._tp_enabled     = rules.get("partial_tp", {}).get("enabled", True)
         self._tp1_close_pct  = rules.get("partial_tp", {}).get("tp1_close_pct", 0.5)
@@ -141,10 +150,12 @@ class PositionManager:
         self._struct_buffer  = rules.get("trailing_stop", {}).get("structural_buffer_usd", 50)
         self._min_trail_pct  = rules.get("trailing_stop", {}).get("min_trail_pct", 0.003)
         self._max_hold_hours = rules.get("max_hold", {}).get("hours", 72)
-        # AT-M2 FIX: 讀取 force_close_condition 設定
         self._force_close_cond = rules.get("max_hold", {}).get(
             "force_close_condition", "always"
         )
+        # Hard SL / Server-stop buffer 改由 risk_config 統一控制
+        self._hard_sl_buffer     = risk_cfg.get("hard_sl", {}).get("buffer_pct", 0.003)
+        self._server_stop_buffer = risk_cfg.get("server_side_stop", {}).get("buffer_pct", 0.005)
 
     # ── Open Position ─────────────────────────────────────────────────────────
 
@@ -178,6 +189,7 @@ class PositionManager:
             trailing_pivot_bars = self._trailing_pivot,
             structural_buffer   = self._struct_buffer,
             min_trail_pct       = self._min_trail_pct,
+            hard_sl_buffer_pct  = self._hard_sl_buffer,
         )
 
         trade_id = await self.db.open_trade(
@@ -232,7 +244,8 @@ class PositionManager:
             )
 
             if self.circuit:
-                await self.circuit.record(reason)  # R1 FIX: now async
+                # 以 pnl 判定勝負而非 reason 字串
+                await self.circuit.record(reason, pnl=pos.last_pnl)
 
             try:
                 await self.db.close_position(pos, reason, order)
@@ -311,7 +324,7 @@ class PositionManager:
             )
 
     async def _execute_tp1(self, pos: Position, price: float):
-        """TP1 部分平倉；AT-C2 FIX: 之後更新 server stop qty"""
+        """TP1 部分平倉；之後 cancel+replace server stop 至成本附近。"""
         if not self.executor:
             return
         try:
@@ -324,41 +337,42 @@ class PositionManager:
             await self.executor.partial_close(pos.symbol, pos.side, close_qty)
 
             pos.qty          -= close_qty
+            pos.notional      = round(pos.entry_price * pos.qty, 2)
             pos.realized_pnl += realized
             pos.last_pnl      = realized
             pos.stop_loss     = pos.entry_price  # Move SL to break-even
 
-            # AT-C2 FIX: TP1 後更新 server stop
-            # 原始 server stop 是全倉 qty，需改為剩餘 qty，
-            # 且 hard_sl 跟著新的 stop_loss（= entry）重算
-            buf = 0.003
+            buf = self._hard_sl_buffer
             new_hard_sl = round(
                 pos.entry_price * (1 - buf) if pos.side == "BUY" else pos.entry_price * (1 + buf),
                 2,
             )
             pos.hard_sl_price = new_hard_sl
 
-            if pos.server_stop_order_id:
-                try:
-                    self.executor.client.cancel_order_by_id(pos.server_stop_order_id)
-                except Exception:
-                    pass  # 可能已觸發或取消，忽略
-                pos.server_stop_order_id = None
-
-            new_stop_id = await self.executor.place_server_side_stop(
+            new_stop_id = await self.executor.replace_server_side_stop(
+                old_order_id  = pos.server_stop_order_id,
                 side          = pos.side,
-                qty           = pos.qty,        # 剩餘數量（≈50%）
-                hard_sl_price = new_hard_sl,    # 成本線附近的保底停損
+                qty           = pos.qty,
+                hard_sl_price = new_hard_sl,
+                buffer_pct    = self._server_stop_buffer,
             )
-            if new_stop_id:
-                pos.server_stop_order_id = new_stop_id
+            pos.server_stop_order_id = new_stop_id  # None 代表送失敗，上層已 CRITICAL alert
+
+            # 同步 DB 審計軌跡
+            if pos.trade_id:
+                try:
+                    await self.db.update_trade_stop_loss(
+                        pos.trade_id, pos.stop_loss, pos.hard_sl_price, new_stop_id,
+                    )
+                except Exception:
+                    pass
 
             self.tg.mark_state_changed("SL_MOVED")
             self._create_task(self.tg.notify_tp1(pos.symbol, pos, realized))
 
         except Exception as e:
-            pos.state = PositionState.OPEN  # 回滾，下次 tick 重試
-            await self.tg.alert(f"⚠️ TP1 減倉失敗：{e}", level="WARNING")
+            pos.state = PositionState.OPEN
+            await self.tg.alert(f"TP1 減倉失敗：{e}", level="WARNING")
 
     # ── Candle Close Handler ──────────────────────────────────────────────────
 
@@ -400,12 +414,30 @@ class PositionManager:
             )
             return
 
-        # Trailing stop level 更新
+        # Trailing stop level 更新 + 同步 server stop
         if pos.state == PositionState.TRAILING:
-            old_sl = pos.stop_loss
-            pos.update_structural_trailing(candle)
-            if pos.stop_loss != old_sl:
+            if pos.update_structural_trailing(candle):
                 self.tg.mark_state_changed("SL_MOVED")
+                if self.executor:
+                    try:
+                        new_stop_id = await self.executor.replace_server_side_stop(
+                            old_order_id  = pos.server_stop_order_id,
+                            side          = pos.side,
+                            qty           = pos.qty,
+                            hard_sl_price = pos.hard_sl_price,
+                            buffer_pct    = self._server_stop_buffer,
+                        )
+                        pos.server_stop_order_id = new_stop_id
+                        if pos.trade_id:
+                            await self.db.update_trade_stop_loss(
+                                pos.trade_id, pos.stop_loss,
+                                pos.hard_sl_price, new_stop_id,
+                            )
+                    except Exception as e:
+                        await self.tg.alert(
+                            f"Trailing SL 同步 server stop 失敗：{e}",
+                            level="WARNING",
+                        )
 
         # AT-M2 FIX: Max hold — 依 force_close_condition 決定是否強制出場
         elapsed_h = (datetime.now(timezone.utc) - pos.open_time).total_seconds() / 3600
@@ -474,49 +506,101 @@ class PositionManager:
         return len(self.positions) > 0
 
     async def adopt_orphan(self, symbol: str, pos_data):
-        """接管 Alpaca 持倉並寫入 DB"""
+        """
+        接管 Alpaca 持倉並寫入 DB。
+        優先從 trade_log 還原原始 SL/TP；若無紀錄才退回緊急預設值並發 CRITICAL。
+        """
         try:
             qty       = float(pos_data.qty)
             avg_entry = float(pos_data.avg_entry_price)
             side      = "BUY" if pos_data.side.value == "long" else "SELL"
 
-            pos = Position(
-                symbol             = symbol,
-                side               = side,
-                entry_price        = avg_entry,
-                qty                = qty,
-                notional           = qty * avg_entry,
-                stop_loss          = avg_entry * (0.98 if side == "BUY" else 1.02),
-                hard_sl_price      = avg_entry * (0.977 if side == "BUY" else 1.023),
-                take_profit_1      = avg_entry * (1.04 if side == "BUY" else 0.96),
-                take_profit_2      = avg_entry * (1.06 if side == "BUY" else 0.94),
-                invalidation_level = avg_entry * (0.975 if side == "BUY" else 1.025),
-                trailing_pivot_bars = self._trailing_pivot,
-                structural_buffer   = self._struct_buffer,
-                min_trail_pct       = self._min_trail_pct,
+            pos, trade_id = await self._build_adopted_position(
+                symbol, side, avg_entry, qty, broker_source="alpaca_positions",
             )
-
-            try:
-                trade_id = await self.db.open_trade(
-                    analysis_id   = 0,
-                    symbol        = symbol,
-                    side          = side,
-                    notional      = qty * avg_entry,
-                    fill_price    = avg_entry,
-                    limit_price   = avg_entry,
-                    stop_loss     = pos.stop_loss,
-                    hard_sl_price = pos.hard_sl_price,
-                    take_profit   = pos.take_profit_1,
-                )
+            if trade_id:
                 pos.trade_id = trade_id
-            except Exception as db_err:
-                await self.tg.alert(
-                    f"⚠️ adopt_orphan DB 寫入失敗：{db_err}", level="WARNING"
-                )
-
             self.positions[symbol] = pos
         except Exception as e:
-            await self.tg.alert(f"⚠️ adopt_orphan 失敗：{e}", level="WARNING")
+            await self.tg.alert(f"adopt_orphan 失敗：{e}", level="WARNING")
+
+    async def _build_adopted_position(
+        self, symbol: str, side: str, avg_entry: float, qty: float,
+        broker_source: str,
+    ):
+        """還原或建立接管 Position。有 trade_log 紀錄時用原始 SL/TP，否則緊急預設。"""
+        recovered = None
+        try:
+            recovered = await self.db.find_recent_open_trade(symbol)
+        except Exception:
+            pass
+
+        if recovered:
+            pos = Position(
+                symbol              = symbol,
+                side                = side,
+                entry_price         = avg_entry,
+                qty                 = qty,
+                notional             = qty * avg_entry,
+                stop_loss            = recovered.get("stop_loss") or avg_entry * (0.98 if side == "BUY" else 1.02),
+                hard_sl_price        = recovered.get("hard_sl_price") or avg_entry * (0.977 if side == "BUY" else 1.023),
+                take_profit_1        = recovered.get("take_profit") or avg_entry * (1.04 if side == "BUY" else 0.96),
+                take_profit_2        = avg_entry * (1.06 if side == "BUY" else 0.94),
+                invalidation_level   = avg_entry * (0.975 if side == "BUY" else 1.025),
+                trailing_pivot_bars  = self._trailing_pivot,
+                structural_buffer    = self._struct_buffer,
+                min_trail_pct        = self._min_trail_pct,
+                hard_sl_buffer_pct   = self._hard_sl_buffer,
+                server_stop_order_id = recovered.get("server_stop_order_id"),
+            )
+            await self.tg.alert(
+                f"Reconcile：{symbol} {side} 從 trade_log 還原 SL=${pos.stop_loss:,.0f} "
+                f"TP1=${pos.take_profit_1:,.0f}",
+                level="WARNING",
+            )
+            return pos, recovered.get("id")
+
+        # 無 trade_log 紀錄 → 緊急預設值 + CRITICAL 告警
+        await self.tg.alert(
+            f"Reconcile 警告：{symbol} {side} 找不到 trade_log 記錄，"
+            f"套用緊急預設 SL (avg ±2%)，請儘速手動確認！（來源：{broker_source}）",
+            level="CRITICAL",
+        )
+        pos = Position(
+            symbol              = symbol,
+            side                = side,
+            entry_price         = avg_entry,
+            qty                 = qty,
+            notional            = qty * avg_entry,
+            stop_loss           = avg_entry * (0.98  if side == "BUY" else 1.02),
+            hard_sl_price       = avg_entry * (0.977 if side == "BUY" else 1.023),
+            take_profit_1       = avg_entry * (1.04  if side == "BUY" else 0.96),
+            take_profit_2       = avg_entry * (1.06  if side == "BUY" else 0.94),
+            invalidation_level  = avg_entry * (0.975 if side == "BUY" else 1.025),
+            trailing_pivot_bars = self._trailing_pivot,
+            structural_buffer   = self._struct_buffer,
+            min_trail_pct       = self._min_trail_pct,
+            hard_sl_buffer_pct  = self._hard_sl_buffer,
+        )
+
+        try:
+            trade_id = await self.db.open_trade(
+                analysis_id   = 0,
+                symbol        = symbol,
+                side          = side,
+                notional      = qty * avg_entry,
+                fill_price    = avg_entry,
+                limit_price   = avg_entry,
+                stop_loss     = pos.stop_loss,
+                hard_sl_price = pos.hard_sl_price,
+                take_profit   = pos.take_profit_1,
+            )
+            return pos, trade_id
+        except Exception as db_err:
+            await self.tg.alert(
+                f"adopt DB 寫入失敗：{db_err}", level="WARNING"
+            )
+            return pos, None
 
     async def force_close_missing(self, symbol: str):
         """本地有記錄但 Alpaca 上已無持倉（Server Stop 觸發）→ 同步 DB 並清除"""
@@ -543,7 +627,7 @@ class PositionManager:
         )
 
     async def reconcile_single(self, order):
-        """Ghost 訂單確認成交後，建立本地追蹤持倉"""
+        """Ghost 訂單確認成交後，建立本地追蹤持倉。"""
         try:
             symbol     = order.symbol
             side_val   = str(order.side.value).lower()
@@ -553,7 +637,7 @@ class PositionManager:
 
             if not fill_price or not qty:
                 await self.tg.alert(
-                    f"⚠️ reconcile_single：訂單 {order.id} 無有效成交資料，略過",
+                    f"reconcile_single：訂單 {order.id} 無有效成交資料，略過",
                     level="WARNING",
                 )
                 return
@@ -561,48 +645,20 @@ class PositionManager:
             if symbol in self.positions:
                 return
 
-            pos = Position(
-                symbol              = symbol,
-                side                = side,
-                entry_price         = fill_price,
-                qty                 = qty,
-                notional            = qty * fill_price,
-                stop_loss           = fill_price * (0.98  if side == "BUY" else 1.02),
-                hard_sl_price       = fill_price * (0.977 if side == "BUY" else 1.023),
-                take_profit_1       = fill_price * (1.04  if side == "BUY" else 0.96),
-                take_profit_2       = fill_price * (1.06  if side == "BUY" else 0.94),
-                invalidation_level  = fill_price * (0.975 if side == "BUY" else 1.025),
-                trailing_pivot_bars = self._trailing_pivot,
-                structural_buffer   = self._struct_buffer,
-                min_trail_pct       = self._min_trail_pct,
+            pos, trade_id = await self._build_adopted_position(
+                symbol, side, fill_price, qty, broker_source=f"ghost_order_{order.id}",
             )
-
-            try:
-                trade_id = await self.db.open_trade(
-                    analysis_id   = 0,
-                    symbol        = symbol,
-                    side          = side,
-                    notional      = qty * fill_price,
-                    fill_price    = fill_price,
-                    limit_price   = fill_price,
-                    stop_loss     = pos.stop_loss,
-                    hard_sl_price = pos.hard_sl_price,
-                    take_profit   = pos.take_profit_1,
-                )
+            if trade_id:
                 pos.trade_id = trade_id
-            except Exception as db_err:
-                await self.tg.alert(
-                    f"⚠️ reconcile_single DB 寫入失敗：{db_err}", level="WARNING"
-                )
 
             self.positions[symbol] = pos
             await self.tg.alert(
-                f"⚠️ Ghost 訂單 {order.id} 已接管：{symbol} {side} "
-                f"{qty:.6f} @ ${fill_price:,.0f}（已套用預設 SL）",
+                f"Ghost 訂單 {order.id} 已接管：{symbol} {side} "
+                f"{qty:.6f} @ ${fill_price:,.0f}",
                 level="WARNING",
             )
         except Exception as e:
-            await self.tg.alert(f"⚠️ reconcile_single 失敗：{e}", level="WARNING")
+            await self.tg.alert(f"reconcile_single 失敗：{e}", level="WARNING")
 
     def get_float_pnl(self, symbol: str, price: float) -> float:
         pos = self.positions.get(symbol)
