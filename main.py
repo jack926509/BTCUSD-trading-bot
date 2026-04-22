@@ -98,6 +98,7 @@ class TradingSystem:
             resume      = self._tg_resume,
             get_pnl     = self._tg_pnl,
             get_signals = self._tg_signals,
+            get_stats   = self._tg_stats,   # T4
         )
 
     # ── BE-C3: Task Factory ───────────────────────────────────────────────────
@@ -382,16 +383,31 @@ class TradingSystem:
         self._create_task(self._async_log_and_notify(job, pos))
 
     async def _async_log_and_notify(self, job, pos):
-        """Slow Track：Claude 描述、DB 寫入、Telegram 推播"""
+        """Slow Track：Claude 描述、DB 寫入、Telegram 推播（含 T6 風險顯示）"""
         try:
             description = await self.claude.describe(job.symbol, job.signal)
             analysis_id = await self.db.save_analysis(job.symbol, job.signal, description)
             await self.db.mark_analysis_executed(analysis_id)
             await self.db.update_position_analysis_id(pos.trade_id, analysis_id)
             pos.analysis_id = analysis_id
-            await self.tg.notify_trade_open(job.symbol, job.signal, description)
+
+            # T6 進場風險顯示
+            risk_usd_abs = abs(pos.entry_price - pos.stop_loss) * pos.qty
+            equity       = self.risk.get_equity() if hasattr(self.risk, "get_equity") else 0
+            risk_pct     = (risk_usd_abs / equity) if equity else None
+            # 當日第幾筆（含本倉位自己）
+            today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            stats     = await self.db.get_daily_stats(today_str)
+            trade_no  = stats.get("total", 0) + 1
+
+            await self.tg.notify_trade_open(
+                job.symbol, job.signal, description,
+                risk_usd_abs     = risk_usd_abs,
+                risk_pct_account = risk_pct,
+                trade_no_today   = trade_no,
+            )
         except Exception as e:
-            await self.tg.alert(f"⚠️ Slow Track 記錄失敗：{e}", level="WARNING")
+            await self.tg.alert(f"Slow Track 記錄失敗：{e}", level="WARNING")
 
     async def _force_close_all(self, reason: str):
         """風控上限觸發時強制平倉所有持倉（MANUAL_CLOSE reason 不計入熔斷器）"""
@@ -463,6 +479,99 @@ class TradingSystem:
             "weekly_pnl":    self.risk.weekly_pnl,
             "signal_stats":  self.smc.get_signal_stats(),
         }
+
+    # ── T1 / T7 每日 & 每週結算 ──────────────────────────────────────────────
+
+    async def _recap_scheduler(self):
+        """等到下一個 UTC 00:00 推日報；週日 23:00 推週報"""
+        from datetime import timedelta
+        while True:
+            now = datetime.now(timezone.utc)
+            # 下個 UTC 00:00
+            next_midnight = (now + timedelta(days=1)).replace(
+                hour=0, minute=0, second=5, microsecond=0,
+            )
+            sleep_s = (next_midnight - now).total_seconds()
+            await asyncio.sleep(sleep_s)
+
+            # 日報（昨天統計）
+            try:
+                yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+                stats = await self._build_daily_recap(yesterday)
+                await self.tg.notify_daily_recap(stats)
+            except Exception as e:
+                print(f"[RECAP] daily failed: {e}")
+
+            # 週日 UTC 00:00 時補推上週週報
+            if datetime.now(timezone.utc).weekday() == 0:  # Monday = 0 → 剛結束週日
+                try:
+                    w_stats = await self._build_weekly_recap()
+                    await self.tg.notify_weekly_recap(w_stats)
+                except Exception as e:
+                    print(f"[RECAP] weekly failed: {e}")
+
+    async def _build_daily_recap(self, date_str: str) -> dict:
+        stats = await self.db.get_daily_stats(date_str)
+        # by_source 從 trade_log 查
+        rows  = await self.db._fetchall(
+            """SELECT analysis_id, pnl_usd FROM trade_log
+               WHERE close_time LIKE ? AND close_time IS NOT NULL""",
+            (f"{date_str}%",),
+        )
+        by_source = {}
+        if rows:
+            # 反向查 analysis_log 以取得 signal_source
+            for r in rows:
+                aid = r.get("analysis_id")
+                if not aid:
+                    continue
+                arow = await self.db._fetchone(
+                    "SELECT signal_source FROM analysis_log WHERE id=?", (aid,),
+                )
+                src = (arow or {}).get("signal_source") or "UNKNOWN"
+                d = by_source.setdefault(src, {"total": 0, "win": 0, "pnl": 0.0})
+                d["total"] += 1
+                pnl = r.get("pnl_usd") or 0
+                d["pnl"]   += pnl
+                if pnl > 0:
+                    d["win"] += 1
+
+        # max drawdown 簡易計算：cumulative PnL 低點
+        pnls = [(r.get("pnl_usd") or 0) for r in rows]
+        cum, peak, max_dd = 0.0, 0.0, 0.0
+        for p in pnls:
+            cum += p
+            peak = max(peak, cum)
+            max_dd = min(max_dd, cum - peak)
+
+        stats["by_source"] = by_source
+        stats["max_dd"]    = round(max_dd, 2)
+        stats["avg_rrr"]   = 0  # 可進一步用 analysis.rrr 計算；暫 0
+        return stats
+
+    async def _build_weekly_recap(self) -> dict:
+        from datetime import timedelta
+        today = datetime.now(timezone.utc).date()
+        last_sunday = today - timedelta(days=today.weekday() + 1)  # 上個週日
+        daily_stats = []
+        for i in range(7):
+            d = (last_sunday - timedelta(days=6 - i)).strftime("%Y-%m-%d")
+            ds = await self.db.get_daily_stats(d)
+            daily_stats.append(ds)
+
+        agg = {
+            "total":     sum(d["total"]     for d in daily_stats),
+            "win":       sum(d["win"]       for d in daily_stats),
+            "loss":      sum(d["loss"]      for d in daily_stats),
+            "total_pnl": round(sum(d["total_pnl"] for d in daily_stats), 2),
+            "week":      f"{daily_stats[0]['date']} ~ {daily_stats[-1]['date']}",
+        }
+        if any(d["total"] for d in daily_stats):
+            best  = max(daily_stats, key=lambda d: d["total_pnl"])
+            worst = min(daily_stats, key=lambda d: d["total_pnl"])
+            agg["best_day"]  = {"date": best["date"],  "pnl": best["total_pnl"]}
+            agg["worst_day"] = {"date": worst["date"], "pnl": worst["total_pnl"]}
+        return agg
 
     # ── TG-C1: Telegram Command Callbacks ────────────────────────────────────
 
@@ -554,6 +663,29 @@ class TradingSystem:
             f"勝 {stats.get('win', 0)} / 負 {stats.get('loss', 0)}"
         )
 
+    async def _tg_stats(self) -> str:
+        """T4: 近 7 / 30 天統計（by source 勝率、平均 RRR、總損益）"""
+        from datetime import timedelta
+        lines = ["📈 <b>策略統計</b>", "─" * 24]
+        for days in (7, 30):
+            total_pnl = 0.0
+            total     = 0
+            win       = 0
+            by_source = {}
+            for i in range(days):
+                d = (datetime.now(timezone.utc).date() - timedelta(days=i)).strftime("%Y-%m-%d")
+                ds = await self.db.get_daily_stats(d)
+                total     += ds.get("total", 0)
+                win       += ds.get("win", 0)
+                total_pnl += ds.get("total_pnl", 0.0)
+            rate = (win / total * 100) if total else 0
+            icon = "🟢" if total_pnl >= 0 else "🔴"
+            lines.append(
+                f"<b>近 {days} 天</b>　{total} 筆　勝率 {rate:.1f}%　"
+                f"{icon} {'+' if total_pnl >= 0 else ''}{total_pnl:,.2f}"
+            )
+        return "\n".join(lines)
+
     async def _tg_signals(self) -> str:
         """回傳訊號統計"""
         stats  = self.smc.get_signal_stats()
@@ -627,7 +759,8 @@ class TradingSystem:
             self.feed.start(),
             self.ai_queue.worker(self._process_ai_job),
             self._heartbeat_loop(),
-            self.tg.start_command_handler(),   # TG-C1: 雙向命令介面
+            self._recap_scheduler(),            # T1 / T7 每日 / 每週結算
+            self.tg.start_command_handler(),    # TG-C1: 雙向命令介面
         )
 
 

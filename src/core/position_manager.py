@@ -37,9 +37,25 @@ class Position:
     structural_buffer:   float          = 50.0
     min_trail_pct:       float          = 0.003
     last_pnl:            float          = 0.0
-    realized_pnl:        float          = 0.0   # 累計已實現 PnL（TP1 後更新）
+    realized_pnl:        float          = 0.0
 
-    # Rolling candle window for trailing stop（repr=False 避免日誌污染 BE-M4）
+    # X2 多段出場：list of dicts [{"fraction": 0.3, "price": 105000, "filled": False}]
+    tp_tiers:            list           = field(default_factory=list)
+
+    # X4 Hard SL 延遲確認
+    hard_sl_first_hit_at: Optional[float] = None
+
+    # X5 INVALIDATED 連續 N 根確認計數
+    inval_streak:        int            = 0
+
+    # T3 MFE / MAE 追蹤（以浮動 PnL 計，方便轉成 R 倍數）
+    max_favorable_pnl:   float          = 0.0
+    max_adverse_pnl:     float          = 0.0
+
+    # T2 Proximity alert 去重 flags
+    _proximity_alerted:  set            = field(default_factory=set, repr=False)
+
+    # Rolling candle window for trailing stop
     _candle_buffer: deque = field(
         default_factory=lambda: deque(maxlen=20),
         repr=False,
@@ -144,11 +160,31 @@ class PositionManager:
         rules = get_position_rules()
         risk_cfg = get_risk_config()
 
-        self._tp_enabled     = rules.get("partial_tp", {}).get("enabled", True)
-        self._tp1_close_pct  = rules.get("partial_tp", {}).get("tp1_close_pct", 0.5)
-        self._trailing_pivot = rules.get("trailing_stop", {}).get("trailing_pivot_bars", 3)
-        self._struct_buffer  = rules.get("trailing_stop", {}).get("structural_buffer_usd", 50)
-        self._min_trail_pct  = rules.get("trailing_stop", {}).get("min_trail_pct", 0.003)
+        ptp_cfg = rules.get("partial_tp", {})
+        self._tp_enabled     = ptp_cfg.get("enabled", True)
+        self._tp_tiers_cfg   = ptp_cfg.get("tiers") or [
+            {"fraction": ptp_cfg.get("tp1_close_pct", 0.5), "target": "tp1"}
+        ]
+        self._be_plus_pct    = ptp_cfg.get("be_plus_pct", 0.0005)
+
+        ts_cfg = rules.get("trailing_stop", {})
+        # X6 Adaptive trailing
+        self._trailing_pivot_pre  = ts_cfg.get("trailing_pivot_bars_pre_tp1",
+                                       ts_cfg.get("trailing_pivot_bars", 5))
+        self._trailing_pivot_post = ts_cfg.get("trailing_pivot_bars_post_tp1",
+                                       ts_cfg.get("trailing_pivot_bars", 2))
+        self._trailing_pivot = self._trailing_pivot_pre   # 預設用 pre_tp1
+        self._struct_buffer  = ts_cfg.get("structural_buffer_usd", 50)
+        self._min_trail_pct  = ts_cfg.get("min_trail_pct", 0.003)
+
+        # X5 INVALIDATED 連續確認
+        inval_cfg = rules.get("invalidation", {})
+        self._inval_confirm_bars = inval_cfg.get("confirm_consecutive_bars", 1)
+
+        # X4 Hard SL 延遲確認
+        hsl_cfg = rules.get("hard_sl", {})
+        self._hard_sl_confirm_delay = hsl_cfg.get("confirm_delay_sec", 0)
+
         self._max_hold_hours = rules.get("max_hold", {}).get("hours", 72)
         self._force_close_cond = rules.get("max_hold", {}).get(
             "force_close_condition", "always"
@@ -156,6 +192,10 @@ class PositionManager:
         # Hard SL / Server-stop buffer 改由 risk_config 統一控制
         self._hard_sl_buffer     = risk_cfg.get("hard_sl", {}).get("buffer_pct", 0.003)
         self._server_stop_buffer = risk_cfg.get("server_side_stop", {}).get("buffer_pct", 0.005)
+
+        # T6 Entry risk tracking：當日交易編號
+        self._daily_trade_count = 0
+        self._daily_trade_date  = None
 
     # ── Open Position ─────────────────────────────────────────────────────────
 
@@ -174,6 +214,18 @@ class PositionManager:
 
         notional = fill_price * qty
 
+        # X2: 依 config tiers 生成本倉位的出場目標
+        tp_tiers = []
+        for tier in self._tp_tiers_cfg:
+            target = tier.get("target", "tp1")
+            price  = signal.take_profit_1 if target == "tp1" else signal.take_profit_2
+            tp_tiers.append({
+                "fraction": tier.get("fraction", 0.5),
+                "price":    price,
+                "filled":   False,
+                "target":   target,
+            })
+
         pos = Position(
             symbol              = symbol,
             side                = signal.direction,
@@ -186,10 +238,11 @@ class PositionManager:
             take_profit_2       = signal.take_profit_2,
             invalidation_level  = signal.invalidation_level,
             analysis_id         = analysis_id,
-            trailing_pivot_bars = self._trailing_pivot,
+            trailing_pivot_bars = self._trailing_pivot_pre,
             structural_buffer   = self._struct_buffer,
             min_trail_pct       = self._min_trail_pct,
             hard_sl_buffer_pct  = self._hard_sl_buffer,
+            tp_tiers            = tp_tiers,
         )
 
         trade_id = await self.db.open_trade(
@@ -268,35 +321,66 @@ class PositionManager:
     # ── Tick Handler (Fast Track) ─────────────────────────────────────────────
 
     async def on_tick(self, symbol: str, price: float):
+        import time as _time
         pos = self.positions.get(symbol)
         if not pos or pos.state not in (PositionState.OPEN, PositionState.TRAILING):
             return
 
-        # R7 FIX: 持續更新浮動 PnL（供 heartbeat / /status 顯示）
+        # 浮動 PnL / MFE / MAE（T3）
         pos.last_pnl = pos.calc_float_pnl(price)
+        if pos.last_pnl > pos.max_favorable_pnl:
+            pos.max_favorable_pnl = pos.last_pnl
+        if pos.last_pnl < pos.max_adverse_pnl:
+            pos.max_adverse_pnl = pos.last_pnl
 
-        # TP1 check（只在 OPEN 態）
-        if self._tp_enabled and pos.state == PositionState.OPEN and pos.is_tp1_hit(price):
-            pos.state = PositionState.TRAILING
-            self._create_task(self._execute_tp1(pos, price))
-            return
+        # T2 Proximity alert（距離 TP/SL 0.2% 內推一次）
+        await self._check_proximity_alert(pos, price)
 
-        # TP2 check（TRAILING 態）
-        if pos.state == PositionState.TRAILING and pos.is_tp2_hit(price):
+        # X2 多段出場：依序檢查未 filled 的 tier
+        if self._tp_enabled and pos.state in (PositionState.OPEN, PositionState.TRAILING):
+            for idx, tier in enumerate(pos.tp_tiers):
+                if tier["filled"]:
+                    continue
+                hit = (price >= tier["price"]) if pos.side == "BUY" else (price <= tier["price"])
+                if hit:
+                    # 第一段命中 → 進 TRAILING；最後一段命中 → 全倉 TP2 出場
+                    if idx == len(pos.tp_tiers) - 1:
+                        pos.state = PositionState.CLOSING
+                        self._create_task(self._execute_final_tp(pos, price, tier))
+                    else:
+                        pos.state = PositionState.TRAILING
+                        self._create_task(self._execute_partial_tp(pos, price, tier, idx))
+                    return
+
+        # X4 Hard SL 延遲確認
+        if pos.is_hard_sl_triggered(price):
+            now = _time.monotonic()
+            if self._hard_sl_confirm_delay > 0:
+                if pos.hard_sl_first_hit_at is None:
+                    pos.hard_sl_first_hit_at = now
+                    return  # 等下一個 tick 再判斷
+                if now - pos.hard_sl_first_hit_at < self._hard_sl_confirm_delay:
+                    return  # 延遲期間不動作
+            # 超過延遲期仍觸發 → 出場
             pos.state = PositionState.CLOSING
+            trigger = price
             self._create_task(
                 self._execute_close(
-                    pos, "TP2", price,
+                    pos, "HARD_SL", trigger,
                     extra_factory=lambda fill: (
-                        f"TP2 全倉出場：${fill:,.0f}，"
-                        f"獲利 +${pos.last_pnl:,.0f}　持倉 {pos.hold_duration_str()}"
+                        f"插針觸發價：${trigger:,.0f}（延遲 {self._hard_sl_confirm_delay}s 確認）\n"
+                        f"出場成交：${fill:,.0f}\n"
+                        f"虧損：−${abs(pos.last_pnl):,.0f}　持倉 {pos.hold_duration_str()}"
                     ),
-                    rollback_state=PositionState.TRAILING,
+                    rollback_state=PositionState.OPEN,
                 )
             )
             return
+        else:
+            # 價格回復 → 清除 hard SL first_hit flag
+            pos.hard_sl_first_hit_at = None
 
-        # AT-M3 FIX: Trailing SL 也加入 tick-level 觸發
+        # Trailing SL tick 觸發
         if pos.state == PositionState.TRAILING and pos.is_trailing_sl_triggered(price):
             pos.state = PositionState.CLOSING
             self._create_task(
@@ -305,23 +389,112 @@ class PositionManager:
                     rollback_state=PositionState.TRAILING,
                 )
             )
-            return
 
-        # Hard SL：盤中觸發立即出場
-        if pos.is_hard_sl_triggered(price):
-            pos.state = PositionState.CLOSING
-            trigger   = price
-            self._create_task(
-                self._execute_close(
-                    pos, "HARD_SL", trigger,
-                    extra_factory=lambda fill: (
-                        f"插針觸發價：${trigger:,.0f}\n"
-                        f"出場成交：${fill:,.0f}（市價）\n"
-                        f"虧損：−${abs(pos.last_pnl):,.0f}　持倉 {pos.hold_duration_str()}"
-                    ),
-                    rollback_state=PositionState.OPEN,
+    async def _check_proximity_alert(self, pos, price: float):
+        """T2：價格接近 TP/SL 0.2% 內時推一次"""
+        threshold = 0.002
+        checks = [
+            ("TP1", pos.take_profit_1),
+            ("TP2", pos.take_profit_2),
+            ("SL",  pos.stop_loss),
+        ]
+        for tag, target in checks:
+            if not target or tag in pos._proximity_alerted:
+                continue
+            dist = abs(price - target) / target if target else 1
+            if dist <= threshold:
+                pos._proximity_alerted.add(tag)
+                side = "距" if tag != "SL" else "離"
+                icon = "🎯" if tag != "SL" else "⚠️"
+                diff_usd = abs(price - target)
+                try:
+                    await self.tg.alert(
+                        f"{icon} {pos.symbol} {side} {tag} ${target:,.0f}"
+                        f" 只剩 ${diff_usd:,.0f}（{dist*100:.2f}%）",
+                        level="INFO",
+                    )
+                except Exception:
+                    pass
+
+    async def _execute_partial_tp(self, pos: Position, price: float, tier: dict, idx: int):
+        """
+        X2 單段部分出場：平 tier.fraction 的倉位；
+        若是第一段，執行 BE+（X3）並把 trailing 改 tighter（X6）。
+        """
+        if not self.executor:
+            return
+        try:
+            # 以 *原始* qty × fraction 計算要平掉多少
+            base_qty  = pos.qty / max(1 - sum(t["fraction"] for t in pos.tp_tiers[:idx]), 0.01)
+            close_qty = round(base_qty * tier["fraction"], 8)
+            close_qty = min(close_qty, pos.qty)  # 避免超平
+            if pos.side == "BUY":
+                realized = (price - pos.entry_price) * close_qty
+            else:
+                realized = (pos.entry_price - price) * close_qty
+
+            await self.executor.partial_close(pos.symbol, pos.side, close_qty)
+
+            pos.qty          -= close_qty
+            pos.notional      = round(pos.entry_price * pos.qty, 2)
+            pos.realized_pnl += realized
+            pos.last_pnl      = realized
+            tier["filled"]    = True
+
+            # X3 BE+：第一段命中後把 SL 推到 entry × (1 ± be_plus_pct)
+            if idx == 0:
+                be_pct = self._be_plus_pct
+                pos.stop_loss = round(
+                    pos.entry_price * (1 + be_pct) if pos.side == "BUY"
+                    else pos.entry_price * (1 - be_pct),
+                    2,
                 )
+                # X6 Adaptive：TP1 後改緊
+                pos.trailing_pivot_bars = self._trailing_pivot_post
+                pos._candle_buffer.clear()  # 重新累積 pivot window
+
+            # Hard SL 跟著新 SL
+            buf = self._hard_sl_buffer
+            pos.hard_sl_price = round(
+                pos.stop_loss * (1 - buf) if pos.side == "BUY" else pos.stop_loss * (1 + buf),
+                2,
             )
+
+            # Replace server stop
+            new_stop_id = await self.executor.replace_server_side_stop(
+                old_order_id  = pos.server_stop_order_id,
+                side          = pos.side,
+                qty           = pos.qty,
+                hard_sl_price = pos.hard_sl_price,
+                buffer_pct    = self._server_stop_buffer,
+            )
+            pos.server_stop_order_id = new_stop_id
+
+            # DB 審計
+            if pos.trade_id:
+                try:
+                    await self.db.update_trade_stop_loss(
+                        pos.trade_id, pos.stop_loss, pos.hard_sl_price, new_stop_id,
+                    )
+                except Exception:
+                    pass
+
+            self.tg.mark_state_changed("SL_MOVED")
+            self._create_task(self.tg.notify_tp1(pos.symbol, pos, realized))
+        except Exception as e:
+            pos.state = PositionState.OPEN
+            await self.tg.alert(f"TP{idx+1} 減倉失敗：{e}", level="WARNING")
+
+    async def _execute_final_tp(self, pos: Position, price: float, tier: dict):
+        """最後一段 tier 命中 → 全倉出場，reason=TP2"""
+        await self._execute_close(
+            pos, "TP2", price,
+            extra_factory=lambda fill: (
+                f"TP2 全倉出場：${fill:,.0f}，"
+                f"獲利 +${pos.last_pnl:,.0f}　持倉 {pos.hold_duration_str()}"
+            ),
+            rollback_state=PositionState.TRAILING,
+        )
 
     async def _execute_tp1(self, pos: Position, price: float):
         """TP1 部分平倉；之後 cancel+replace server stop 至成本附近。"""
@@ -387,17 +560,29 @@ class PositionManager:
             if pos.state == PositionState.CLOSING:
                 return
 
-        # INVALIDATED check（收盤確認）
+        # INVALIDATED check（連續 N 根收盤確認，減少 M1 噪音誤判）
         if pos.is_invalidated(candle["close"]):
-            pos.state = PositionState.CLOSING
-            self._create_task(
-                self._execute_close(
-                    pos, "INVALIDATED", candle["close"],
-                    extra_factory=lambda fill: f"結構收盤失效　持倉 {pos.hold_duration_str()}",
-                    rollback_state=PositionState.OPEN,
+            pos.inval_streak += 1
+            if pos.inval_streak >= self._inval_confirm_bars:
+                pos.state = PositionState.CLOSING
+                self._create_task(
+                    self._execute_close(
+                        pos, "INVALIDATED", candle["close"],
+                        extra_factory=lambda fill: (
+                            f"結構收盤失效（連 {pos.inval_streak} 根確認）　"
+                            f"持倉 {pos.hold_duration_str()}"
+                        ),
+                        rollback_state=PositionState.OPEN,
+                    )
                 )
+                return
+            # 未達確認門檻，繼續觀察
+            await self.tg.alert(
+                f"{pos.symbol} 首次 INVALIDATED 收盤觀察（{pos.inval_streak}/{self._inval_confirm_bars}）",
+                level="INFO",
             )
-            return
+        else:
+            pos.inval_streak = 0  # 一根未破就重置計數
 
         # Trailing stop（收盤確認，M1 收盤）
         if pos.is_trailing_sl_triggered(candle["close"]):

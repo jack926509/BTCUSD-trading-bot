@@ -1,7 +1,16 @@
 partial_tp:
   enabled: true
+  # X2 三段出場：TP1 30% / TP2 30% / runner 40% 走 trailing
+  tiers:
+    - fraction: 0.30     # TP1 倉位比例
+      target:   tp1      # 使用 signal.take_profit_1
+    - fraction: 0.30     # TP2 倉位比例
+      target:   tp2
+  # 向後相容：若 tiers 未設，則退回 tp1_close_pct 單段
   tp1_close_pct: 0.5
   move_sl_to_entry: true
+  # X3 Break-Even Plus：TP1 後 SL 設 entry × (1 ± be_plus_pct)
+  be_plus_pct: 0.0005    # 0.05%
 
 trailing_stop:
   enabled: true
@@ -10,11 +19,21 @@ trailing_stop:
   structural_buffer_usd: 50
   min_trail_pct: 0.003
   fallback_trail_pct: 0.015
+  # X6 Adaptive trailing：TP1 前較寬，TP1 後較緊
+  trailing_pivot_bars_pre_tp1: 5
+  trailing_pivot_bars_post_tp1: 2
+  # 向後相容
   trailing_pivot_bars: 3
 
 invalidation:
   enabled: true
   check_on: candle_close
+  # X5 連續 N 根收盤確認才出場（降低 M1 噪音誤判）
+  confirm_consecutive_bars: 2
+
+hard_sl:
+  # X4 Hard SL 觸發後延遲確認秒數，避免插針秒回誤出場
+  confirm_delay_sec: 3
 
 max_hold:
   enabled: true

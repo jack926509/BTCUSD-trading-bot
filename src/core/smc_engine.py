@@ -32,6 +32,12 @@ class SMCSignal:
     # OB / FVG levels for notification
     ob_level:           Optional[float] = None
     fvg_range:          Optional[str]   = None
+    # E5 / E6 / E2 extra
+    atr_value:          Optional[float] = None
+    retrace_pct:        Optional[float] = None
+    confluence:         bool            = False
+    # X1: 結構目標 TP flag
+    tp_is_structural:   bool            = False
 
 
 class SMCContext:
@@ -92,6 +98,40 @@ class SMCEngine:
         self.bos_entry_model     = entry_cfg.get("bos_entry_model", "ob_fvg")
         self.choch_entry_model   = entry_cfg.get("choch_entry_model", "fvg_only")
         self.sweep_entry_model   = entry_cfg.get("sweep_entry_model", "ob_fvg")
+
+        # E1 Premium/Discount
+        pd_cfg = entry_cfg.get("premium_discount", {})
+        self.pd_enabled          = pd_cfg.get("enabled", False)
+        self.pd_threshold        = pd_cfg.get("discount_threshold", 0.5)
+        self.pd_relax_bars       = pd_cfg.get("strong_trend_relax_bars", 8)
+
+        # E2 Confluence
+        conf_cfg = entry_cfg.get("confluence", {})
+        self.conf_enabled        = conf_cfg.get("enabled", True)
+        self.conf_require        = conf_cfg.get("require_overlap", False)
+
+        # E3 Rejection candle
+        rej_cfg = entry_cfg.get("rejection_candle", {})
+        self.rej_enabled         = rej_cfg.get("enabled", False)
+        self.rej_wick_ratio      = rej_cfg.get("min_wick_ratio", 1.2)
+
+        # E4 OB entry mode
+        self.ob_entry_mode       = entry_cfg.get("ob_entry_mode", "edge")
+
+        # E5 ATR SL
+        atr_cfg = entry_cfg.get("atr_sl", {})
+        self.atr_enabled         = atr_cfg.get("enabled", False)
+        self.atr_period          = atr_cfg.get("atr_period", 14)
+        self.atr_multiplier      = atr_cfg.get("atr_multiplier", 1.5)
+        self.atr_tf              = atr_cfg.get("atr_timeframe", "M1")
+        self.atr_min_pct         = atr_cfg.get("min_sl_pct", 0.003)
+        self.atr_max_pct         = atr_cfg.get("max_sl_pct", 0.015)
+
+        # E6 OTE Fibonacci
+        ote_cfg = entry_cfg.get("ote", {})
+        self.ote_enabled         = ote_cfg.get("enabled", False)
+        self.ote_min             = ote_cfg.get("min_retrace", 0.62)
+        self.ote_max             = ote_cfg.get("max_retrace", 0.79)
 
         self._hard_sl_buffer     = 0.003
 
@@ -411,6 +451,9 @@ class SMCEngine:
                     return SMCSignal(reject_reason="SWEEP_HTF_MISALIGN")
                 if htf_bias == "BEARISH" and sweep["direction"] != "BEARISH":
                     return SMCSignal(reject_reason="SWEEP_HTF_MISALIGN")
+            direction = "BUY" if sweep["direction"] == "BULLISH" else "SELL"
+            if not self._is_in_discount_zone(symbol, direction, candle["close"]):
+                return SMCSignal(reject_reason="SWEEP_NOT_IN_DISCOUNT_ZONE")
             return self._build_sweep_signal(symbol, candle, sweep, htf_bias)
 
         # 2. Check BOS / CHoCH
@@ -425,7 +468,17 @@ class SMCEngine:
             return SMCSignal(reject_reason="NO_VALID_LTF_TRIGGER")
 
         # 4. Build entry signal based on trigger type
-        is_choch = "CHOCH" in ltf_trigger
+        is_choch  = "CHOCH" in ltf_trigger
+        direction = "BUY" if "BULLISH" in ltf_trigger else "SELL"
+
+        # E1 Premium/Discount
+        if not self._is_in_discount_zone(symbol, direction, candle["close"]):
+            return SMCSignal(reject_reason="NOT_IN_DISCOUNT_ZONE")
+
+        # E6 OTE
+        if not self._is_in_ote(symbol, direction, candle["close"]):
+            return SMCSignal(reject_reason="NOT_IN_OTE")
+
         return self._build_structure_signal(symbol, candle, ltf_trigger, htf_bias, is_choch)
 
     def _detect_bos_choch(self, symbol: str, candle: dict) -> Optional[str]:
@@ -509,11 +562,19 @@ class SMCEngine:
         price     = candle["close"]
 
         ob, fvg   = self._find_ob_fvg(symbol, direction, self.sweep_entry_model)
-        entry, sl, tp1, tp2, inval = self._calc_levels(
-            direction, price, ob, fvg, candle
+        entry, sl, tp1, tp2, inval, atr_val, tp_struct = self._calc_levels(
+            direction, price, ob, fvg, candle, symbol=symbol,
         )
         hard_sl   = self._calc_hard_sl(direction, sl)
         rrr       = self._calc_rrr(direction, entry, sl, tp1)
+
+        confluence = bool(ob and fvg and not (ob["high"] < fvg["low"] or ob["low"] > fvg["high"]))
+        conds = ["SWEEP", "HTF_ALIGN"]
+        if ob:  conds.append("OB")
+        if fvg: conds.append("FVG")
+        if confluence:     conds.append("CONFLUENCE")
+        if tp_struct:      conds.append("STRUCT_TP")
+        if atr_val:        conds.append("ATR_SL")
 
         return SMCSignal(
             direction          = direction,
@@ -531,7 +592,10 @@ class SMCEngine:
             swept_level        = sweep["swept_level"],
             ob_level           = ob["low"] if ob else None,
             fvg_range          = f"${fvg['low']:,.0f}–${fvg['high']:,.0f}" if fvg else None,
-            conditions_met     = ["SWEEP", "HTF_ALIGN", "OB" if ob else "FVG"],
+            conditions_met     = conds,
+            atr_value          = atr_val,
+            confluence         = confluence,
+            tp_is_structural   = tp_struct,
         )
 
     def _build_structure_signal(self, symbol: str, candle: dict,
@@ -542,14 +606,39 @@ class SMCEngine:
 
         entry_model = self.choch_entry_model if is_choch else self.bos_entry_model
         ob, fvg   = self._find_ob_fvg(symbol, direction, entry_model)
-        entry, sl, tp1, tp2, inval = self._calc_levels(
-            direction, price, ob, fvg, candle
+
+        # E3 Rejection candle：當前蠟燭需對 zone 有拒絕動作
+        zone = ob or fvg
+        if zone and self.rej_enabled:
+            if not self._has_rejection(candle, direction, zone["low"], zone["high"]):
+                return SMCSignal(reject_reason="NO_REJECTION_CANDLE")
+
+        entry, sl, tp1, tp2, inval, atr_val, tp_struct = self._calc_levels(
+            direction, price, ob, fvg, candle, symbol=symbol,
         )
         hard_sl   = self._calc_hard_sl(direction, sl)
         rrr       = self._calc_rrr(direction, entry, sl, tp1)
         source    = "CHOCH" if is_choch else "BOS"
 
         disp_bars = self.choch_displacement if is_choch else None
+
+        # 計算 retrace 比例（供 Telegram 顯示）
+        retrace = None
+        imp = self._last_impulse(symbol, direction)
+        if imp:
+            swing_low, swing_high = imp
+            rng = swing_high - swing_low
+            if rng > 0:
+                retrace = (swing_high - entry) / rng if direction == "BUY" else (entry - swing_low) / rng
+
+        confluence = bool(ob and fvg and not (ob["high"] < fvg["low"] or ob["low"] > fvg["high"]))
+        conds = [source, "HTF_ALIGN"]
+        if ob:  conds.append("OB")
+        if fvg: conds.append("FVG")
+        if confluence:  conds.append("CONFLUENCE")
+        if self.rej_enabled: conds.append("REJECTION")
+        if tp_struct:   conds.append("STRUCT_TP")
+        if atr_val:     conds.append("ATR_SL")
 
         return SMCSignal(
             direction          = direction,
@@ -567,17 +656,19 @@ class SMCEngine:
             displacement_bars  = disp_bars,
             ob_level           = ob["low"] if ob else None,
             fvg_range          = f"${fvg['low']:,.0f}–${fvg['high']:,.0f}" if fvg else None,
-            conditions_met     = [source, "HTF_ALIGN", "OB" if ob else "", "FVG" if fvg else ""],
+            conditions_met     = conds,
+            atr_value          = atr_val,
+            retrace_pct        = retrace,
+            confluence         = confluence,
+            tp_is_structural   = tp_struct,
         )
 
     # ── Level Calculations ───────────────────────────────────────────────────
 
     def _find_ob_fvg(self, symbol: str, direction: str, entry_model: str = "ob_fvg"):
         """
-        依 config 的 entry_model 決定回踩參考：
-        - ob_fvg：OB 優先，OB 無則退 FVG（預設，BOS / SWEEP 用）
-        - fvg_only：只看 FVG，不看 OB（CHoCH 預設，要求更乾淨的回踩）
-        - ob_only：只看 OB
+        依 config 的 entry_model 決定回踩參考；
+        若 confluence.enabled，優先選擇與 FVG 重疊的 OB，勝率較高。
         """
         obs  = self._order_blocks[symbol][self.ltf]
         fvgs = self._fvgs[symbol][self.ltf]
@@ -588,57 +679,217 @@ class SMCEngine:
         ob  = next((o for o in reversed(obs)  if o["type"] == ob_type), None)
         fvg = next((f for f in reversed(fvgs) if f["type"] == fvg_type and not f["filled"]), None)
 
+        # E2: Confluence — 若有多個 OB，優先挑與最新 FVG 重疊的
+        if self.conf_enabled and fvg and obs:
+            for o in reversed(obs):
+                if o["type"] != ob_type:
+                    continue
+                # 價格區間重疊判定
+                if not (o["high"] < fvg["low"] or o["low"] > fvg["high"]):
+                    ob = o
+                    break
+
         if entry_model == "fvg_only":
             return None, fvg
         if entry_model == "ob_only":
             return ob, None
         return ob, fvg
 
+    # ── E1 Premium/Discount ──────────────────────────────────────────────────
+
+    def _is_in_discount_zone(self, symbol: str, direction: str, price: float) -> bool:
+        """
+        BUY：價格在 HTF range 下半（discount）；
+        SELL：價格在 HTF range 上半（premium）。
+        Range 來源：最近 HTF swing high/low 配對。
+        """
+        if not self.pd_enabled:
+            return True
+        htf_bars = list(self._bars[symbol][self.htf])
+        if len(htf_bars) < 20:
+            return True  # 資料不足不擋
+        recent = htf_bars[-self.pd_relax_bars:] if self.pd_relax_bars > 0 else htf_bars[-20:]
+        hi = max(b["high"] for b in recent)
+        lo = min(b["low"]  for b in recent)
+        rng = hi - lo
+        if rng <= 0:
+            return True
+        pos = (price - lo) / rng   # 0 = 最低、1 = 最高
+        if direction == "BUY":
+            return pos <= self.pd_threshold
+        else:
+            return pos >= (1 - self.pd_threshold)
+
+    # ── E3 Rejection Candle ──────────────────────────────────────────────────
+
+    def _has_rejection(self, candle: dict, direction: str,
+                       zone_low: float, zone_high: float) -> bool:
+        """
+        BUY：下影線穿入 zone 但收盤回到 zone 之上，且下影 > 實體 × ratio；
+        SELL：對稱。
+        """
+        if not self.rej_enabled:
+            return True
+        body  = abs(candle["close"] - candle["open"])
+        if body == 0:
+            return False
+        low, high, op, cl = candle["low"], candle["high"], candle["open"], candle["close"]
+        if direction == "BUY":
+            lower_wick = min(op, cl) - low
+            return (low <= zone_high and cl > zone_high
+                    and lower_wick >= body * self.rej_wick_ratio)
+        else:
+            upper_wick = high - max(op, cl)
+            return (high >= zone_low and cl < zone_low
+                    and upper_wick >= body * self.rej_wick_ratio)
+
+    # ── E5 ATR ───────────────────────────────────────────────────────────────
+
+    def _calc_atr(self, symbol: str) -> Optional[float]:
+        if not self.atr_enabled:
+            return None
+        bars = list(self._bars[symbol][self.atr_tf])[-(self.atr_period + 1):]
+        if len(bars) < self.atr_period + 1:
+            return None
+        trs = []
+        for i in range(1, len(bars)):
+            prev_close = bars[i - 1]["close"]
+            h, l = bars[i]["high"], bars[i]["low"]
+            trs.append(max(h - l, abs(h - prev_close), abs(l - prev_close)))
+        return sum(trs) / len(trs)
+
+    # ── E6 OTE Fibonacci ─────────────────────────────────────────────────────
+
+    def _last_impulse(self, symbol: str, direction: str):
+        """回傳 (swing_low, swing_high) 作為最近 impulse 的起訖"""
+        sh = list(self._swing_highs[symbol][self.ltf])
+        sl = list(self._swing_lows[symbol][self.ltf])
+        if not sh or not sl:
+            return None
+        # 取最新各一點作為 impulse 兩端
+        return (sl[-1], sh[-1])
+
+    def _is_in_ote(self, symbol: str, direction: str, price: float) -> bool:
+        if not self.ote_enabled:
+            return True
+        imp = self._last_impulse(symbol, direction)
+        if imp is None:
+            return True
+        swing_low, swing_high = imp
+        rng = swing_high - swing_low
+        if rng <= 0:
+            return True
+        if direction == "BUY":
+            retrace = (swing_high - price) / rng  # 0 = 頂、1 = 底
+        else:
+            retrace = (price - swing_low) / rng
+        return self.ote_min <= retrace <= self.ote_max
+
     def _calc_levels(self, direction: str, price: float,
-                     ob: dict, fvg: dict, candle: dict):
+                     ob: dict, fvg: dict, candle: dict,
+                     symbol: str = None):
         """
-        進場價 = OB/FVG 邊緣；
-        SL = 進場價外側 0.5%（M1 BTC 短線，給足噪音緩衝）；
-        Invalidation = SL 外側再加 hard_sl_buffer；
-        TP1 = 2R；TP2 = 3R。
+        進場：
+        - E4: ob_entry_mode = midpoint → entry = OB_low + 25% range（BUY）
+        - edge（原邏輯）：entry = OB_low 邊緣
+        SL：
+        - E5: ATR × multiplier（優先），否則 fallback 0.5% buffer
+        TP：
+        - X1: 優先用結構（最近對向 swing、對向 EQH/EQL、對向 OB），fallback 2R / 3R
         """
-        sl_buf = 0.005   # 0.5% SL cushion beyond OB/FVG edge
+        atr = self._calc_atr(symbol) if symbol else None
+
+        # Entry 決定 ──────────────────────────────────────────────
+        zone = ob or fvg
+        if zone:
+            if ob and self.ob_entry_mode == "midpoint":
+                rng = ob["high"] - ob["low"]
+                entry = ob["low"] + 0.25 * rng if direction == "BUY" else ob["high"] - 0.25 * rng
+            else:
+                entry = zone["low"] if direction == "BUY" else zone["high"]
+        else:
+            entry = price
+
+        # SL 決定 ─────────────────────────────────────────────────
+        zone_edge = (zone["low"] if direction == "BUY" else zone["high"]) if zone else price
+        if atr:
+            atr_sl_dist = atr * self.atr_multiplier
+            pct         = atr_sl_dist / entry if entry else 0
+            pct         = max(self.atr_min_pct, min(self.atr_max_pct, pct))
+            if direction == "BUY":
+                sl = zone_edge * (1 - pct)
+            else:
+                sl = zone_edge * (1 + pct)
+        else:
+            sl_buf = 0.005
+            if direction == "BUY":
+                sl = zone_edge * (1 - sl_buf)
+            else:
+                sl = zone_edge * (1 + sl_buf)
+
+        # TP 決定（X1 結構目標） ───────────────────────────────────
+        tp1, tp2, tp_structural = self._calc_structural_tps(
+            symbol, direction, entry, sl
+        )
+
+        # INVALIDATION
+        if direction == "BUY":
+            inval = sl * (1 - self._hard_sl_buffer)
+        else:
+            inval = sl * (1 + self._hard_sl_buffer)
+
+        return (round(entry, 2), round(sl, 2),
+                round(tp1, 2), round(tp2, 2), round(inval, 2),
+                atr, tp_structural)
+
+    def _calc_structural_tps(self, symbol: str, direction: str,
+                              entry: float, sl: float):
+        """
+        TP1：對向最近 swing（若不存在或太近，fallback 2R）
+        TP2：對向 EQH/EQL 或對向 OB（若不存在，fallback 3R）
+        回傳 (tp1, tp2, is_structural)
+        """
+        r = abs(entry - sl)
+        fallback_tp1 = entry + r * 2 if direction == "BUY" else entry - r * 2
+        fallback_tp2 = entry + r * 3 if direction == "BUY" else entry - r * 3
+        if not symbol:
+            return fallback_tp1, fallback_tp2, False
+
+        sh = list(self._swing_highs[symbol][self.ltf])
+        sl_pts = list(self._swing_lows[symbol][self.ltf])
+        eqs = self._eqh_eql[symbol][self.ltf]
+        obs = self._order_blocks[symbol][self.ltf]
+
+        tp1 = None
+        tp2 = None
 
         if direction == "BUY":
-            if ob:
-                entry = ob["low"]
-                sl    = ob["low"] * (1 - sl_buf)
-            elif fvg:
-                entry = fvg["low"]
-                sl    = fvg["low"] * (1 - sl_buf)
+            # TP1 = 最近一個在 entry 上方的 swing high
+            candidates = [s for s in sh if s > entry + r]  # 至少 1R 以上
+            if candidates:
+                tp1 = min(candidates)
+            # TP2 = EQH 或對向（BEARISH）OB 的 low
+            eq_hs = [e["price"] for e in eqs if e["type"] == "EQH" and e["price"] > (tp1 or entry)]
+            if eq_hs:
+                tp2 = min(eq_hs)
             else:
-                entry = price
-                sl    = price * 0.985
-
-            inval  = sl * (1 - self._hard_sl_buffer)
-            tp1    = entry + (entry - sl) * 2
-            tp2    = entry + (entry - sl) * 3
+                op = [o["low"] for o in obs if o["type"] == "BEARISH" and o["low"] > (tp1 or entry)]
+                if op:
+                    tp2 = min(op)
         else:
-            if ob:
-                entry = ob["high"]
-                sl    = ob["high"] * (1 + sl_buf)
-            elif fvg:
-                entry = fvg["high"]
-                sl    = fvg["high"] * (1 + sl_buf)
+            candidates = [s for s in sl_pts if s < entry - r]
+            if candidates:
+                tp1 = max(candidates)
+            eq_ls = [e["price"] for e in eqs if e["type"] == "EQL" and e["price"] < (tp1 or entry)]
+            if eq_ls:
+                tp2 = max(eq_ls)
             else:
-                entry = price
-                sl    = price * 1.015
+                op = [o["high"] for o in obs if o["type"] == "BULLISH" and o["high"] < (tp1 or entry)]
+                if op:
+                    tp2 = max(op)
 
-            inval  = sl * (1 + self._hard_sl_buffer)
-            tp1    = entry - (sl - entry) * 2
-            tp2    = entry - (sl - entry) * 3
-
-        entry = round(entry, 2)
-        sl    = round(sl, 2)
-        tp1   = round(tp1, 2)
-        tp2   = round(tp2, 2)
-        inval = round(inval, 2)
-        return entry, sl, tp1, tp2, inval
+        structural = tp1 is not None or tp2 is not None
+        return (tp1 or fallback_tp1), (tp2 or fallback_tp2), structural
 
     def _calc_hard_sl(self, direction: str, sl: float) -> float:
         buf = self._hard_sl_buffer

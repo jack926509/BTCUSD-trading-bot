@@ -84,6 +84,7 @@ class TelegramNotifier:
         self._cb_resume       = None
         self._cb_get_pnl      = None
         self._cb_get_signals  = None
+        self._cb_get_stats    = None   # T4: /stats
 
         # Command Application
         self._app: Optional[Application] = None
@@ -98,6 +99,7 @@ class TelegramNotifier:
         resume      = None,
         get_pnl     = None,
         get_signals = None,
+        get_stats   = None,
     ):
         """TradingSystem 注入命令回調函式，讓 Telegram 可控制系統"""
         self._cb_get_status  = get_status
@@ -106,6 +108,7 @@ class TelegramNotifier:
         self._cb_resume      = resume
         self._cb_get_pnl     = get_pnl
         self._cb_get_signals = get_signals
+        self._cb_get_stats   = get_stats
 
     # ── Rate-Limited Send (TG-H3) ─────────────────────────────────────────────
 
@@ -203,7 +206,41 @@ class TelegramNotifier:
 
     # ── Trade Open Notification ───────────────────────────────────────────────
 
-    async def notify_trade_open(self, symbol: str, signal, description: str = ""):
+    # ── T5 ASCII 結構圖 ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _ascii_chart(entry: float, sl: float, tp1: float, tp2: float,
+                     ob: float = None, price_now: float = None,
+                     rows: int = 7, direction: str = "BUY") -> str:
+        """
+        以固定 rows 行的 ASCII 圖顯示 entry / SL / TP1 / TP2 / 當前價 相對位置。
+        高價在上、低價在下。
+        """
+        pts = {"TP2": tp2, "TP1": tp1, "Entry": entry, "SL": sl}
+        if ob:        pts["OB"]  = ob
+        if price_now: pts["Now"] = price_now
+        vals = sorted(pts.values(), reverse=True)
+        hi, lo = max(vals), min(vals)
+        span   = hi - lo or 1
+
+        lines = []
+        for r in range(rows):
+            row_price = hi - (span / (rows - 1)) * r
+            tags = []
+            # 誰最接近這條 line
+            for name, v in pts.items():
+                rel = (hi - v) / span * (rows - 1)
+                if abs(rel - r) < 0.5:
+                    tags.append(name)
+            tag_str = "/".join(tags) if tags else ""
+            bar     = "│" if not tags else "┤"
+            lines.append(f"{row_price:>10,.0f} {bar} {tag_str}")
+        return "<pre>" + _esc("\n".join(lines)) + "</pre>"
+
+    async def notify_trade_open(self, symbol: str, signal, description: str = "",
+                                 risk_usd_abs: float = None,
+                                 risk_pct_account: float = None,
+                                 trade_no_today: int = None):
         direction = getattr(signal, "direction", "?")
         side_str  = "LONG 🔺" if direction == "BUY" else "SHORT 🔻"
         entry     = getattr(signal, "entry_limit_price", 0) or 0
@@ -232,21 +269,50 @@ class TelegramNotifier:
         if fvg_range:
             zone_line += f"🕳  FVG　{fvg_range}\n"
 
+        # E2/E6 extras
+        confluence = getattr(signal, "confluence", False)
+        tp_struct  = getattr(signal, "tp_is_structural", False)
+        atr_val    = getattr(signal, "atr_value", None)
+        retrace    = getattr(signal, "retrace_pct", None)
+
+        tag_bits = []
+        if confluence: tag_bits.append("✨ OB+FVG")
+        if tp_struct:  tag_bits.append("🧱 結構 TP")
+        if atr_val:    tag_bits.append(f"📊 ATR ${atr_val:,.0f}")
+        if retrace is not None: tag_bits.append(f"📐 OTE {retrace*100:.0f}%")
+        quality_line = "　｜　".join(tag_bits) if tag_bits else ""
+
+        # T6 進場風險顯示
+        risk_block = ""
+        if risk_usd_abs is not None:
+            pct_str = f"（帳戶 {risk_pct_account*100:.2f}%）" if risk_pct_account else ""
+            nth     = f"　｜　今日第 {trade_no_today} 筆" if trade_no_today else ""
+            risk_block = f"💸 本單風險　${risk_usd_abs:,.2f} {pct_str}{nth}\n"
+
+        # T5 ASCII 結構圖
+        ascii_block = self._ascii_chart(
+            entry=entry, sl=sl, tp1=tp1, tp2=tp2, ob=ob_level,
+            direction=direction,
+        )
+
         text = (
             f"📊 <b>開倉 · {_esc(symbol)} {side_str}</b>\n"
             f"{'─' * 24}\n"
             f"⏰ {_now_utc()}\n"
             f"{bias_icon} HTF　{_esc(htf_bias)}　｜　{_esc(src_label)}\n"
-            f"{'─' * 24}\n"
+            + (f"{quality_line}\n" if quality_line else "")
+            + f"{'─' * 24}\n"
             f"💰 進場限價　<b>${entry:,.0f}</b>\n"
             f"🎯 TP1　${tp1:,.0f}　<i>({_pct(tp1_usd, entry)}  +${tp1_usd:,.0f})</i>\n"
             f"🏁 TP2　${tp2:,.0f}　<i>({_pct(tp2_usd, entry)}  +${tp2_usd:,.0f})</i>\n"
             f"🔻 SL　${sl:,.0f}　<i>({_pct(-risk_usd, entry)}  -${risk_usd:,.0f})</i>\n"
             f"⚡ Hard SL　${hard_sl:,.0f}　<i>盤中觸發</i>\n"
             f"{'─' * 24}\n"
-            f"📐 RRR　1 : {rrr:.2f}　｜　風險 ${risk_usd:,.0f}\n"
+            + risk_block
+            + f"📐 RRR　1 : {rrr:.2f}\n"
             f"🔒 失效　收盤穿越 ${inval:,.0f}\n"
             + (f"{'─' * 24}\n{zone_line}" if zone_line else "")
+            + f"{'─' * 24}\n{ascii_block}\n"
             + (f"<i>{_esc(description)}</i>" if description else "")
         )
         await self._send(text, reply_markup=self._dashboard_button())
@@ -315,6 +381,22 @@ class TelegramNotifier:
 
         if hold_str:
             lines.append(f"⏱ 持倉時間　{hold_str}")
+
+        # T3 MFE / MAE — 若 Position 有追蹤則顯示
+        mfe = getattr(pos, "max_favorable_pnl", None)
+        mae = getattr(pos, "max_adverse_pnl", None)
+        if mfe is not None and mae is not None and (mfe or mae):
+            entry_price = pos.entry_price
+            sl_price    = getattr(pos, "stop_loss", 0) or 0
+            risk_unit   = abs(entry_price - sl_price) * (getattr(pos, "qty", 0) or 0)
+            mfe_r = mfe / risk_unit if risk_unit else 0
+            mae_r = mae / risk_unit if risk_unit else 0
+            captured = (pnl / mfe * 100) if mfe > 0 else 0
+            lines.append(
+                f"📈 MFE {_pnl(mfe)} ({mfe_r:+.1f}R)  📉 MAE {_pnl(mae)} ({mae_r:+.1f}R)"
+            )
+            if mfe > 0:
+                lines.append(f"🎣 抓到　{captured:.0f}% 最大獲利")
 
         if extra:
             # extra 內可能含 <b> 等已格式化標籤；若不含 < 就當純文字 escape
@@ -414,6 +496,71 @@ class TelegramNotifier:
         )
         await self._send(text)
 
+    # ── T1 每日收盤結算 ───────────────────────────────────────────────────────
+
+    async def notify_daily_recap(self, stats: dict):
+        """
+        stats:
+          {"date": "2026-04-22", "total": 5, "win": 3, "loss": 2,
+           "total_pnl": 87.2, "by_source": {"BOS": {...}, "CHOCH": {...}},
+           "max_dd": -32.5, "avg_rrr": 2.1}
+        """
+        date     = stats.get("date", "今日")
+        total    = stats.get("total", 0)
+        win      = stats.get("win", 0)
+        loss     = stats.get("loss", 0)
+        pnl      = stats.get("total_pnl", 0.0)
+        max_dd   = stats.get("max_dd", 0.0)
+        avg_rrr  = stats.get("avg_rrr", 0.0)
+        win_rate = (win / total * 100) if total else 0
+
+        pnl_icon = "🟢" if pnl >= 0 else "🔴"
+        lines = [
+            f"📅 <b>日報　{_esc(date)}</b>",
+            "─" * 24,
+            f"📊 交易　{total} 筆　（勝 {win} / 負 {loss}）",
+            f"🎯 勝率　{win_rate:.1f}%　｜　平均 RRR {avg_rrr:.2f}",
+            f"{pnl_icon} 當日損益　<b>{_pnl(pnl)}</b>",
+            f"📉 最大 DD　{_pnl(max_dd)}",
+        ]
+        by_src = stats.get("by_source") or {}
+        if by_src:
+            lines.append("─" * 24)
+            lines.append("📡 <b>策略分解</b>")
+            for src, s in by_src.items():
+                s_pnl = s.get("pnl", 0)
+                s_win = s.get("win", 0)
+                s_tot = s.get("total", 0)
+                rate  = (s_win / s_tot * 100) if s_tot else 0
+                lines.append(f"  {_esc(src)}　{s_tot} 筆　勝率 {rate:.0f}%　{_pnl(s_pnl)}")
+        lines.append(f"⏰ {_now_utc()}")
+        await self._send("\n".join(lines))
+
+    async def notify_weekly_recap(self, stats: dict):
+        week_label = stats.get("week", "本週")
+        total    = stats.get("total", 0)
+        win      = stats.get("win", 0)
+        loss     = stats.get("loss", 0)
+        pnl      = stats.get("total_pnl", 0.0)
+        best_day = stats.get("best_day", None)
+        worst    = stats.get("worst_day", None)
+        win_rate = (win / total * 100) if total else 0
+
+        pnl_icon = "🟢" if pnl >= 0 else "🔴"
+        lines = [
+            f"📆 <b>週報　{_esc(week_label)}</b>",
+            "─" * 24,
+            f"📊 本週交易　{total} 筆（勝 {win} / 負 {loss}）",
+            f"🎯 勝率　{win_rate:.1f}%",
+            f"{pnl_icon} 本週損益　<b>{_pnl(pnl)}</b>",
+        ]
+        if best_day:
+            lines.append(f"🟢 最佳日　{_esc(best_day.get('date'))}　{_pnl(best_day.get('pnl', 0))}")
+        if worst:
+            lines.append(f"🔴 最差日　{_esc(worst.get('date'))}　{_pnl(worst.get('pnl', 0))}")
+        lines.append(f"⏰ {_now_utc()}")
+        await self._send("\n".join(lines))
+
     # ── WS Disconnect Notification ────────────────────────────────────────────
 
     async def notify_ws_disconnect(self, attempt: int, delay: int, pos_snapshot: str = ""):
@@ -488,6 +635,16 @@ class TelegramNotifier:
             text = "⚠️ 訊號統計回調尚未初始化"
         await update.message.reply_html(text)
 
+    async def _cmd_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """T4: /stats — 回傳近 7/30 天策略表現"""
+        if not self._is_authorized(update):
+            return
+        if self._cb_get_stats:
+            text = await self._cb_get_stats()
+        else:
+            text = "⚠️ 回測統計回調尚未初始化"
+        await update.message.reply_html(text)
+
     async def _cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_authorized(update):
             return
@@ -502,6 +659,7 @@ class TelegramNotifier:
             f"/close   ─ 緊急全倉平倉\n"
             f"/pnl     ─ 今日/本週損益\n"
             f"/signals ─ 訊號統計\n"
+            f"/stats   ─ 近 7/30 天策略表現\n"
             f"/help    ─ 顯示此說明"
         )
         await update.message.reply_html(text)
@@ -524,6 +682,7 @@ class TelegramNotifier:
         self._app.add_handler(CommandHandler("close",   self._cmd_close))
         self._app.add_handler(CommandHandler("pnl",     self._cmd_pnl))
         self._app.add_handler(CommandHandler("signals", self._cmd_signals))
+        self._app.add_handler(CommandHandler("stats",   self._cmd_stats))
         self._app.add_handler(CommandHandler("help",    self._cmd_help))
 
         await self._app.initialize()

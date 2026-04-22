@@ -43,10 +43,40 @@ entry:
   choch_entry_model: fvg_only
   sweep_entry_model: ob_fvg
 
+  # E1: Premium/Discount 濾波 — BUY 只在 HTF range 下半，SELL 只在上半
   premium_discount:
     enabled: true
     range_source: htf
+    discount_threshold: 0.5   # 低於中線視為 discount
     strong_trend_relax_bars: 8
+
+  # E2: OB + FVG 疊加區視為高 confluence，conditions_met 會標記 CONFLUENCE
+  confluence:
+    enabled: true
+    require_overlap: true
+
+  # E3: 拒絕蠟燭確認 — 觸發 bar 需穿入 zone 後收回外側且含長影線
+  rejection_candle:
+    enabled: true
+    min_wick_ratio: 1.2       # 影線 / 實體
+
+  # E4: OB 中點進場 — entry = OB_low + 25% × OB range（BUY）
+  ob_entry_mode: midpoint     # midpoint / edge
+
+  # E5: ATR-based SL — 取代固定 0.5% buffer
+  atr_sl:
+    enabled: true
+    atr_period: 14
+    atr_multiplier: 1.5
+    atr_timeframe: M1         # 目前系統 MTF 緩存只到 M1/H1/H4，挑 M1 x 14 根≈15 分鐘波動
+    min_sl_pct: 0.003         # 下限 0.3%
+    max_sl_pct: 0.015         # 上限 1.5%
+
+  # E6: OTE（Optimal Trade Entry）Fibonacci 過濾
+  ote:
+    enabled: true
+    min_retrace: 0.62
+    max_retrace: 0.79
 
   session_filter:
     enabled: true
