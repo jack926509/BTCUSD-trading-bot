@@ -14,7 +14,7 @@ from typing import Optional
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.error import RetryAfter, TimedOut, NetworkError
+from telegram.error import RetryAfter, TimedOut, NetworkError, Conflict
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 import logging
@@ -661,6 +661,31 @@ class TelegramNotifier:
             text = "⚠️ 回測統計回調尚未初始化"
         await update.message.reply_html(text)
 
+    async def _on_polling_error(self, update, context):
+        """
+        捕獲 Telegram polling 層級錯誤；Conflict 代表另一個 bot 實例也在 poll
+        → 與 Alpaca WS 連線上限往往是同一根因（重複部署）
+        """
+        err = context.error
+        if isinstance(err, Conflict):
+            # 節流：同 10 分鐘內只推一次
+            import time as _t
+            now = _t.monotonic()
+            if now - getattr(self, "_last_conflict_alert", 0) < 600:
+                return
+            self._last_conflict_alert = now
+            await self.alert(
+                "🔴 偵測到另一個 bot 實例在使用同一個 TELEGRAM_BOT_TOKEN!\n"
+                "→ 通常也就是 Alpaca WS 連線上限的兇手（重複部署 / 本機 + 雲端同跑）\n"
+                "排查：\n"
+                "1) 本機：pkill -f 'python main.py'\n"
+                "2) Zeabur：檢查 Projects 是否有同 repo 重複 deploy\n"
+                "3) VS Code / IDE debugger 是否還掛著 main.py",
+                level="CRITICAL",
+            )
+        else:
+            log.warning("Telegram polling error: %r", err)
+
     async def _cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_authorized(update):
             return
@@ -700,6 +725,10 @@ class TelegramNotifier:
         self._app.add_handler(CommandHandler("signals", self._cmd_signals))
         self._app.add_handler(CommandHandler("stats",   self._cmd_stats))
         self._app.add_handler(CommandHandler("help",    self._cmd_help))
+
+        # 當另一個 bot 實例也在 poll 同一個 token 時 → 立即 CRITICAL 通知
+        # （多實例是 Alpaca WS 連線上限 + 兩邊訊息重複的根因）
+        self._app.add_error_handler(self._on_polling_error)
 
         await self._app.initialize()
         await self._app.start()
