@@ -564,31 +564,33 @@ class SMCEngine:
                      ob: dict, fvg: dict, candle: dict):
         """
         進場價 = OB/FVG 邊緣；
-        SL = 進場價外側 0.2%（緊貼結構）；
-        Invalidation = SL 外側再一個 buffer（結構失效點，比 SL 更深）；
+        SL = 進場價外側 0.5%（M5 BTC 平均波動 0.3-0.7%/bar，給足緩衝）；
+        Invalidation = SL 外側再加 hard_sl_buffer；
         TP1 = 2R；TP2 = 3R。
         """
+        sl_buf = 0.005   # 0.5% SL cushion beyond OB/FVG edge
+
         if direction == "BUY":
             if ob:
                 entry = ob["low"]
-                sl    = ob["low"] * 0.998
+                sl    = ob["low"] * (1 - sl_buf)
             elif fvg:
                 entry = fvg["low"]
-                sl    = fvg["low"] * 0.998
+                sl    = fvg["low"] * (1 - sl_buf)
             else:
                 entry = price
                 sl    = price * 0.985
 
-            inval  = sl * (1 - self._hard_sl_buffer)   # 結構失效點比 SL 更深
+            inval  = sl * (1 - self._hard_sl_buffer)
             tp1    = entry + (entry - sl) * 2
             tp2    = entry + (entry - sl) * 3
         else:
             if ob:
                 entry = ob["high"]
-                sl    = ob["high"] * 1.002
+                sl    = ob["high"] * (1 + sl_buf)
             elif fvg:
                 entry = fvg["high"]
-                sl    = fvg["high"] * 1.002
+                sl    = fvg["high"] * (1 + sl_buf)
             else:
                 entry = price
                 sl    = price * 1.015

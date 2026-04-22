@@ -153,6 +153,13 @@ class PositionManager:
     async def open(self, symbol: str, signal, order, analysis_id=None) -> Position:
         fill_price = float(getattr(order, "filled_avg_price", signal.entry_limit_price) or signal.entry_limit_price)
         qty        = float(getattr(order, "filled_qty", 0) or 0)
+
+        if qty <= 0:
+            raise ValueError(
+                f"open(): filled_qty={qty} — order may not have filled. "
+                f"order_id={getattr(order, 'id', 'N/A')} status={getattr(order, 'status', 'N/A')}"
+            )
+
         notional   = fill_price * qty
 
         pos = Position(

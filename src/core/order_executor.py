@@ -56,8 +56,12 @@ class OrderExecutor:
 
     # ── 進場（預設限價單） ─────────────────────────────────────────────────────
 
+    _ALPACA_CRYPTO_MIN_NOTIONAL = 10.0  # ~0.0001 BTC at $100k; keep floor above exchange min
+
     async def place_market(self, side: str, notional: float) -> object:
         """Market order for testing — fills immediately at current price."""
+        if notional < self._ALPACA_CRYPTO_MIN_NOTIONAL:
+            raise OrderError(f"市價單金額 ${notional:.2f} 低於最低限額 ${self._ALPACA_CRYPTO_MIN_NOTIONAL}")
         req = MarketOrderRequest(
             symbol        = "BTC/USD",
             notional      = round(notional, 2),
@@ -93,6 +97,8 @@ class OrderExecutor:
         limit_price：OB/FVG 回踩目標價。
         stop_price：若提供則改用 Stop-Limit（備援模式）。
         """
+        if notional < self._ALPACA_CRYPTO_MIN_NOTIONAL:
+            raise OrderError(f"限價單金額 ${notional:.2f} 低於最低限額 ${self._ALPACA_CRYPTO_MIN_NOTIONAL}")
         if stop_price:
             req = StopLimitOrderRequest(
                 symbol        = "BTC/USD",

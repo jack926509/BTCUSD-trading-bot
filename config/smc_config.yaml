@@ -18,17 +18,17 @@ structure:
 liquidity:
   order_block:
     enabled: true
-    max_age_bars: 30
-    min_body_ratio: 0.6
+    max_age_bars: 24        # M5×24 = 2 h; keeps OBs fresh and relevant
+    min_body_ratio: 0.55    # slightly relaxed for M5 smaller candles
     mitigation_type: close
     wick_penetration_threshold: 0.7
   fair_value_gap:
     enabled: true
-    min_gap_usd: 50
+    min_gap_usd: 80         # M5 FVGs need minimum size to filter noise
     partial_fill_threshold: 0.5
   equal_highs_lows:
     enabled: true
-    tolerance_usd: 150
+    tolerance_usd: 100      # tighter EQL tolerance on M5
   breaker_block:
     enabled: true
   sweep:
@@ -50,15 +50,13 @@ entry:
 
   session_filter:
     enabled: true
+    # Only trade London + NY sessions (07:00–20:00 UTC) — highest BTC liquidity.
+    # Block everything else: NY close, full Asia, pre-London.
     no_entry_sessions:
-      - name: "Asia_Low_Liquidity"
+      - name: "Low_Liquidity"
         utc_start: "20:00"
-        utc_end:   "01:00"
-      - name: "Pre_London_Watch"
-        utc_start: "05:00"
         utc_end:   "07:00"
-        mode: "require_displacement"
-    session_open_cooldown_bars: 1
+    session_open_cooldown_bars: 2
     affect_open_positions: false
 
 signal_logic:

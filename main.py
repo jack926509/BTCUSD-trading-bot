@@ -314,9 +314,13 @@ class TradingSystem:
                 )
                 return
 
-        pos = await self.position_mgr.open(
-            job.symbol, job.signal, order, analysis_id=None
-        )
+        try:
+            pos = await self.position_mgr.open(
+                job.symbol, job.signal, order, analysis_id=None
+            )
+        except ValueError as e:
+            await self.tg.alert(f"🔴 開倉失敗（數量異常）：{e}", level="CRITICAL")
+            return
 
         server_stop_id = await self.executor.place_server_side_stop(
             side          = job.signal.direction,
