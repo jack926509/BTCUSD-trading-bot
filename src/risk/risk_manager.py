@@ -1,21 +1,31 @@
+import logging
 import os
 from datetime import date, datetime, timezone
 
 from src.config.loader import get_risk_config
+
+log = logging.getLogger(__name__)
+
+
+def _iso_week_key(d: date) -> str:
+    iso = d.isocalendar()
+    return f"{iso.year}-W{iso.week:02d}"
 
 
 class RiskManager:
     def __init__(self):
         self._cfg            = get_risk_config()
         self._account_equity = None
+        self._db             = None   # 由 load_state(db) 注入
 
+        today = datetime.now(timezone.utc).date()
         # Daily loss tracking
         self._daily_pnl:   float = 0.0
-        self._daily_date:  date  = datetime.now(timezone.utc).date()
+        self._daily_date:  date  = today
 
-        # AT-H5: Weekly loss tracking
+        # AT-H5: Weekly loss tracking；與 db.py 存的 weekly_iso 對齊
         self._weekly_pnl:  float = 0.0
-        self._week_number: int   = datetime.now(timezone.utc).isocalendar()[1]
+        self._weekly_iso:  str   = _iso_week_key(today)
 
     # ── Properties ────────────────────────────────────────────────────────────
 
@@ -33,30 +43,77 @@ class RiskManager:
     # ── Date Rollover ─────────────────────────────────────────────────────────
 
     def _check_date_rollover(self):
-        now   = datetime.now(timezone.utc)
-        today = now.date()
-        week  = now.isocalendar()[1]
+        now      = datetime.now(timezone.utc)
+        today    = now.date()
+        week_key = _iso_week_key(today)
 
         if self._daily_date != today:
             self._daily_pnl  = 0.0
             self._daily_date = today
 
-        if self._week_number != week:
-            self._weekly_pnl  = 0.0
-            self._week_number = week
+        if self._weekly_iso != week_key:
+            self._weekly_pnl = 0.0
+            self._weekly_iso = week_key
+
+    # ── Persistence（對應 db.py 的 load_risk_state / save_risk_state）──────────
+
+    async def load_state(self, db):
+        """啟動時從 DB 恢復每日 / 每週 PnL，跨重啟保護風控上限"""
+        self._db = db
+        try:
+            row = await db.load_risk_state()
+        except Exception as e:
+            log.warning("load_risk_state query failed: %s", e)
+            return
+        if not row:
+            return
+
+        today      = datetime.now(timezone.utc).date()
+        today_iso  = today.isoformat()
+        today_week = _iso_week_key(today)
+
+        # 只在 DB 記錄與今天同日 / 同週時恢復數字；跨期則維持 0
+        if row.get("daily_date") == today_iso:
+            self._daily_pnl = float(row.get("daily_pnl") or 0.0)
+        if row.get("weekly_iso") == today_week:
+            self._weekly_pnl = float(row.get("weekly_pnl") or 0.0)
+
+    async def _persist(self):
+        """寫回當前每日 / 每週 PnL；供 record_trade_pnl 與 graceful shutdown 呼叫"""
+        if not self._db:
+            return
+        try:
+            await self._db.save_risk_state(
+                self._daily_pnl,
+                self._daily_date.isoformat(),
+                self._weekly_pnl,
+                self._weekly_iso,
+            )
+        except Exception as e:
+            log.warning("save_risk_state failed: %s", e)
 
     # ── Equity ────────────────────────────────────────────────────────────────
 
     def set_equity(self, equity: float):
         self._account_equity = equity
 
+    def get_equity(self) -> float:
+        return self._account_equity or 0.0
+
     # ── PnL Recording ─────────────────────────────────────────────────────────
 
     def record_trade_pnl(self, pnl: float):
-        """每次出場後呼叫，追蹤當日 + 本週累計 PnL"""
+        """每次出場後呼叫，追蹤當日 + 本週累計 PnL，並非阻塞寫回 DB"""
+        import asyncio
         self._check_date_rollover()
         self._daily_pnl  += pnl
         self._weekly_pnl += pnl
+        if self._db is not None:
+            try:
+                asyncio.create_task(self._persist())
+            except RuntimeError:
+                # 無 running loop（不應發生，但保底）
+                pass
 
     # ── Loss Guards ───────────────────────────────────────────────────────────
 
