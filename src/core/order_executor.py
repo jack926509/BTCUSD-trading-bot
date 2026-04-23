@@ -2,6 +2,7 @@ import asyncio
 import os
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
+    GetOrdersRequest,
     LimitOrderRequest,
     MarketOrderRequest,
     StopLimitOrderRequest,
@@ -325,19 +326,46 @@ class OrderExecutor:
             limit_price   = limit_price,
         )
 
-        for attempt in range(3):
+        attempt           = 0
+        wash_trade_done   = False   # wash trade 只清一次，避免無限迴圈
+        while attempt < 3:
             try:
                 order = await self._submit(req)
                 return str(order.id)
             except Exception as e:
+                err_str      = str(e)
+                is_wash_trade = (
+                    "40310000" in err_str
+                    or "wash trade"  in err_str.lower()
+                    or "wash_trade"  in err_str.lower()
+                )
+
+                if is_wash_trade and not wash_trade_done:
+                    # 清除衝突委託單後重試，不消耗 attempt 配額
+                    wash_trade_done = True
+                    log.warning(
+                        "server stop rejected (wash trade 40310000), "
+                        "cancelling conflicting open orders and retrying"
+                    )
+                    await self.tg.alert(
+                        "⚠️ Server Stop 遭 Wash Trade 拒絕（前次殘留委託單衝突）\n"
+                        "正在清除衝突委託單後重試…",
+                        level="WARNING",
+                    )
+                    n = await self._cancel_conflicting_open_orders(stop_side)
+                    log.info("wash-trade cleanup: cancelled %d conflicting orders", n)
+                    await asyncio.sleep(1)  # 等 Alpaca 處理取消
+                    continue                # 重試，attempt 不遞增
+
                 log.warning("server-side stop attempt %d/3 failed: %s", attempt + 1, e)
-                if attempt == 2:
+                attempt += 1
+                if attempt >= 3:
                     await self.tg.alert(
                         f"伺服器端停損單送出失敗（3 次重試後放棄）：{e}",
                         level="CRITICAL",
                     )
                     return None
-                await asyncio.sleep(0.5 * (2 ** attempt))
+                await asyncio.sleep(0.5 * (2 ** (attempt - 1)))
 
     async def replace_server_side_stop(
         self, old_order_id: str, side: str, qty: float,
@@ -356,15 +384,81 @@ class OrderExecutor:
             side=side, qty=qty, hard_sl_price=hard_sl_price, buffer_pct=buffer_pct,
         )
 
+    # ── Open-Order Helpers（Wash-Trade 防護用）────────────────────────────────
+
+    async def _get_open_orders(self, symbol: str = "BTC/USD") -> list:
+        """取得 Alpaca 上該 symbol 所有開放委託單（非阻塞）。"""
+        try:
+            req    = GetOrdersRequest(status="open")
+            orders = await asyncio.to_thread(self.client.get_orders, req)
+            return [o for o in (orders or []) if getattr(o, "symbol", "") == symbol]
+        except Exception as e:
+            log.warning("get_open_orders failed: %s", e)
+            return []
+
+    async def _cancel_open_limit_orders(self, symbol: str = "BTC/USD") -> int:
+        """取消所有非 stop 類型的開放委託單（啟動清理，防 wash trade）。
+        Stop / stop-limit 委託單保留（可能是上一個 session 的 server stop）。"""
+        orders    = await self._get_open_orders(symbol)
+        cancelled = 0
+        for o in orders:
+            order_type = str(getattr(o, "order_type", "") or "").lower()
+            if "stop" in order_type:
+                continue
+            try:
+                await self._cancel_order(str(o.id))
+                cancelled += 1
+                log.info("startup cleanup: cancelled stale %s %s order %s",
+                         order_type, getattr(o, "side", "?"), o.id)
+            except Exception as e:
+                log.warning("cancel stale order %s failed: %s", o.id, e)
+        return cancelled
+
+    async def _cancel_conflicting_open_orders(
+        self, stop_side: OrderSide, symbol: str = "BTC/USD"
+    ) -> int:
+        """取消造成 wash trade 的衝突委託單：
+        下 SELL stop 時清除 open BUY 委託；下 BUY stop 時清除 open SELL 委託。"""
+        conflict_side = OrderSide.BUY if stop_side == OrderSide.SELL else OrderSide.SELL
+        orders        = await self._get_open_orders(symbol)
+        cancelled     = 0
+        for o in orders:
+            if getattr(o, "side", None) != conflict_side:
+                continue
+            try:
+                await self._cancel_order(str(o.id))
+                cancelled += 1
+                log.info("wash-trade cleanup: cancelled %s order %s limit=%s",
+                         conflict_side, o.id, getattr(o, "limit_price", "?"))
+            except Exception as e:
+                log.warning("cancel conflicting order %s failed: %s", o.id, e)
+        return cancelled
+
     # ── Ghost Order 防護 ──────────────────────────────────────────────────────
 
     async def scan_orphan_orders_on_startup(self):
         log.info("Scanning orphan orders on startup...")
+
+        # 1. 處理 DB 記錄的 pending orders（原有邏輯）
         pending = await self.db.get_unconfirmed_orders()
         if not pending:
-            log.info("Scanning orphan orders on startup... none found.")
+            log.info("No DB-recorded pending orders found.")
         for order_id in pending:
             await self._verify_and_handle_order(order_id)
+
+        # 2. 主動清除 Alpaca 上殘留的限價委託單（非 stop 類型）
+        #    這些是前次 session 的進場單，在 Reconcile 接管倉位後若不清除，
+        #    下 server-side stop 時會觸發 wash trade 拒絕（error 40310000）
+        n = await self._cancel_open_limit_orders()
+        if n:
+            log.info("startup: cancelled %d stale open limit orders (wash-trade prevention)", n)
+            await self.tg.alert(
+                f"🧹 啟動清理：取消 {n} 張上次殘留的限價委託單\n"
+                "（防止後續下 Server Stop 時觸發 Wash Trade 拒絕）",
+                level="WARNING",
+            )
+        else:
+            log.info("startup: no stale open limit orders found")
 
     async def _safe_cancel(self, order_id: str) -> bool:
         try:
