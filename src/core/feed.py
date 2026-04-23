@@ -2,7 +2,7 @@ import asyncio
 import os
 import time
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from alpaca.data.live import CryptoDataStream
 from alpaca.data.historical import CryptoHistoricalDataClient
@@ -76,6 +76,11 @@ def _delete_lockfile():
             os.remove(WS_LOCKFILE)
     except Exception:
         pass
+
+
+class _FakeBar:
+    """REST polling 降級模式的輕量 bar 物件（每分鐘重複建立一次，避免在 loop 內定義 class）"""
+    __slots__ = ("symbol", "open", "high", "low", "close", "volume", "timestamp")
 
 
 class DataFeed:
@@ -304,7 +309,6 @@ class DataFeed:
             if now - last_bar_ts >= 60:
                 last_bar_ts = now
                 try:
-                    from datetime import timedelta
                     req = CryptoBarsRequest(
                         symbol_or_symbols="BTC/USD",
                         timeframe=TimeFrame.Minute,
@@ -316,8 +320,6 @@ class DataFeed:
                     if not df.empty:
                         # 取最新一根已收盤的 M1 bar
                         row = df.iloc[-2] if len(df) >= 2 else df.iloc[-1]
-                        class _FakeBar:
-                            pass
                         b = _FakeBar()
                         b.symbol    = "BTC/USD"
                         b.open      = float(row["open"])
@@ -409,14 +411,13 @@ class DataFeed:
         self.latest_bid         = bid
         self.latest_ask         = ask
         self.latest_spread_pct  = (ask - bid) / mid
-        self._spread_updated_at = asyncio.get_running_loop().time()
+        self._spread_updated_at = time.monotonic()
 
     def get_spread_pct(self, max_age_sec: float = 10.0) -> float | None:
         """回傳最新 spread 比例；過期回 None 讓呼叫者決定（降級放行 / 阻擋）"""
         if self._spread_updated_at <= 0:
             return None
-        now = asyncio.get_running_loop().time()
-        if now - self._spread_updated_at > max_age_sec:
+        if time.monotonic() - self._spread_updated_at > max_age_sec:
             return None
         return self.latest_spread_pct
 

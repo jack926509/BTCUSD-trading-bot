@@ -778,22 +778,38 @@ class PositionManager:
         pos = self.positions.pop(symbol, None)
         if not pos:
             return
+
+        # 嘗試從 server stop 委託取得實際成交價，確保 risk PnL 追蹤正確
+        fill_price = 0.0
+        pnl_usd    = 0.0
+        if self.executor and pos.server_stop_order_id:
+            try:
+                order = await self.executor._get_order(pos.server_stop_order_id)
+                fp    = float(getattr(order, "filled_avg_price", None) or 0)
+                if fp > 0:
+                    fill_price   = fp
+                    pnl_usd      = round(pos.calc_float_pnl(fill_price), 2)
+                    pos.last_pnl = pnl_usd
+            except Exception:
+                pass
+
         if pos.trade_id:
             try:
                 await self.db.close_trade(
                     trade_id        = pos.trade_id,
-                    close_price     = 0.0,
-                    pnl_usd         = 0.0,
+                    close_price     = fill_price,
+                    pnl_usd         = pnl_usd,
                     close_reason    = "SERVER_STOP_TRIGGERED",
-                    broker_order_id = None,
+                    broker_order_id = pos.server_stop_order_id,
                 )
             except Exception as e:
                 await self.tg.alert(
                     f"⚠️ force_close_missing DB 更新失敗：{e}", level="WARNING"
                 )
         await self._on_close(pos, "SERVER_STOP_TRIGGERED")
+        pnl_part = f"　損益：${pnl_usd:+,.0f}（@${fill_price:,.0f}）" if fill_price else "（未能取得成交價）"
         await self.tg.alert(
-            f"⚠️ Reconcile：{symbol} 持倉已在 Alpaca 消失（Server Stop 可能已觸發），已同步清除",
+            f"⚠️ Reconcile：{symbol} 持倉已在 Alpaca 消失（Server Stop 已觸發），已同步清除{pnl_part}",
             level="WARNING",
         )
 
