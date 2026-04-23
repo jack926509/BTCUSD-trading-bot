@@ -26,7 +26,7 @@ from src.config.loader import get_smc_config
 from src.core.candle_builder import CandleBuilder
 from src.core.feed import DataFeed
 from src.core.order_executor import OrderExecutor
-from src.core.position_manager import PositionManager
+from src.core.position_manager import PositionManager, PositionState
 from src.core.smc_engine import SMCEngine
 from src.notification.telegram_bot import TelegramNotifier
 from src.risk.circuit_breaker import BreakerState, CircuitBreaker
@@ -438,6 +438,10 @@ class TradingSystem:
         """
         from alpaca.trading.enums import OrderStatus
         for symbol, pos in list(self.position_mgr.positions.items()):
+            # 正在平倉時 server stop 已由 close_position 取消，不重送避免孤兒委託
+            if pos.state in (PositionState.CLOSING, PositionState.CLOSED):
+                continue
+
             if not pos.server_stop_order_id:
                 # 本地已知沒 stop → 補一張
                 try:
@@ -461,6 +465,17 @@ class TradingSystem:
                 order = await self.executor._get_order(pos.server_stop_order_id)
             except Exception:
                 continue
+
+            if order.status == OrderStatus.FILLED:
+                # Server stop 已成交 → Alpaca 倉位已不存在，立即 Reconcile 同步本地狀態
+                await self.tg.alert(
+                    f"⚠️ {symbol} server stop 已成交（持倉已被停損）\n"
+                    f"order={pos.server_stop_order_id}，觸發立即 Reconcile 同步",
+                    level="WARNING",
+                )
+                self._create_task(self.feed._reconcile_positions())
+                continue
+
             if order.status in (OrderStatus.CANCELED, OrderStatus.EXPIRED, OrderStatus.REJECTED):
                 await self.tg.alert(
                     f"{symbol} server stop 已 {order.status}，重送保底",
