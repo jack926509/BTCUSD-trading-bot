@@ -80,6 +80,7 @@ class SMCEngine:
         self.ob_max_age          = ob_cfg.get("max_age_bars", 30)
         self.ob_min_body_ratio   = ob_cfg.get("min_body_ratio", 0.6)
         self.ob_wick_threshold   = ob_cfg.get("wick_penetration_threshold", 0.7)
+        self.ob_mitigation_type  = ob_cfg.get("mitigation_type", "close")  # "close" or "wick"
 
         fvg_cfg                  = self._cfg.get("liquidity", {}).get("fair_value_gap", {})
         self.fvg_min_gap         = fvg_cfg.get("min_gap_usd", 50)
@@ -305,10 +306,11 @@ class SMCEngine:
                 curr["close"] < curr["open"] and
                 curr["close"] < prev2["low"]):
             obs.append({
-                "type": "BEARISH",
-                "high": prev2["high"],
-                "low":  prev2["low"],
-                "age":  0,
+                "type":      "BEARISH",
+                "high":      prev2["high"],
+                "low":       prev2["low"],
+                "age":       0,
+                "mitigated": False,
             })
 
         # Bullish OB: 下跌蠟燭後轉漲
@@ -316,17 +318,28 @@ class SMCEngine:
                 curr["close"] > curr["open"] and
                 curr["close"] > prev2["high"]):
             obs.append({
-                "type": "BULLISH",
-                "high": prev2["high"],
-                "low":  prev2["low"],
-                "age":  0,
+                "type":      "BULLISH",
+                "high":      prev2["high"],
+                "low":       prev2["low"],
+                "age":       0,
+                "mitigated": False,
             })
 
-        # Age OBs and remove stale
+        # Age OBs + OB mitigation（mitigation_type: close → 收盤進入 OB 視為已 mitigated）
+        use_wick = self.ob_mitigation_type == "wick"
         for ob in obs:
             ob["age"] += 1
+            if ob.get("mitigated"):
+                continue
+            penetration = curr["low"] if use_wick else curr["close"]
+            penetration_high = curr["high"] if use_wick else curr["close"]
+            if ob["type"] == "BULLISH" and penetration <= ob["high"] and penetration >= ob["low"]:
+                ob["mitigated"] = True
+            elif ob["type"] == "BEARISH" and penetration_high >= ob["low"] and penetration_high <= ob["high"]:
+                ob["mitigated"] = True
+
         self._order_blocks[symbol][tf] = [
-            ob for ob in obs if ob["age"] <= self.ob_max_age
+            ob for ob in obs if ob["age"] <= self.ob_max_age and not ob.get("mitigated", False)
         ]
 
     def _detect_fvgs(self, symbol: str, tf: str, bars: list):
@@ -460,9 +473,11 @@ class SMCEngine:
             return SMCSignal(reject_reason="NO_HTF_BIAS")
 
         # 1. Check Sweep first (highest priority)
-        sweep = self._check_sweep(
-            symbol, candle, self._eqh_eql[symbol][self.ltf]
-        )
+        # 合併 EQH/EQL 與 MTF swing high/low 作為流動性池（SMC：HTF 流動性更強）
+        ltf_eqs  = self._eqh_eql[symbol][self.ltf]
+        mtf_swings = self._build_mtf_sweep_levels(symbol)
+        sweep_levels = ltf_eqs + mtf_swings
+        sweep = self._check_sweep(symbol, candle, sweep_levels)
         if sweep:
             if self.sweep_htf_align:
                 if htf_bias == "BULLISH" and sweep["direction"] != "BULLISH":
@@ -545,6 +560,16 @@ class SMCEngine:
             return all(b["close"] > b["open"] for b in recent)
         else:
             return all(b["close"] < b["open"] for b in recent)
+
+    def _build_mtf_sweep_levels(self, symbol: str) -> list:
+        """將 MTF swing high/low 轉為與 EQH/EQL 相同格式，供 sweep 檢查使用。
+        MTF 流動性池（H1 swing）通常比 M1 EQH/EQL 更受 smart money 關注。"""
+        levels = []
+        for sh in list(self._swing_highs[symbol][self.mtf])[-5:]:
+            levels.append({"type": "EQH", "price": sh})
+        for sl in list(self._swing_lows[symbol][self.mtf])[-5:]:
+            levels.append({"type": "EQL", "price": sl})
+        return levels
 
     def _check_sweep(self, symbol: str, candle: dict, levels: list) -> Optional[dict]:
         body = abs(candle["close"] - candle["open"])

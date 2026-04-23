@@ -330,7 +330,7 @@ class OrderExecutor:
                 order = await self._submit(req)
                 return str(order.id)
             except Exception as e:
-                log.warning("server-side stop attempt {attempt + 1}/3 failed: {e}")
+                log.warning("server-side stop attempt %d/3 failed: %s", attempt + 1, e)
                 if attempt == 2:
                     await self.tg.alert(
                         f"伺服器端停損單送出失敗（3 次重試後放棄）：{e}",

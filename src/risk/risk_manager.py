@@ -103,17 +103,11 @@ class RiskManager:
     # ── PnL Recording ─────────────────────────────────────────────────────────
 
     def record_trade_pnl(self, pnl: float):
-        """每次出場後呼叫，追蹤當日 + 本週累計 PnL，並非阻塞寫回 DB"""
-        import asyncio
+        """每次出場後呼叫，追蹤當日 + 本週累計 PnL。
+        persist 由呼叫方（_on_position_close）負責 await，避免 GC 回收孤立 task。"""
         self._check_date_rollover()
         self._daily_pnl  += pnl
         self._weekly_pnl += pnl
-        if self._db is not None:
-            try:
-                asyncio.create_task(self._persist())
-            except RuntimeError:
-                # 無 running loop（不應發生，但保底）
-                pass
 
     # ── Loss Guards ───────────────────────────────────────────────────────────
 

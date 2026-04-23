@@ -37,5 +37,5 @@ server_side_stop:
 auto_trade: true
 
 # 測試模式：true = 訊號生成後直接市價成交（忽略限價回踩）
-# 策略驗證完成後改回 false 恢復限價單模式
-use_market_order: true
+# 生產環境必須為 false，讓訊號等待 OB/FVG 回踩後才以限價成交
+use_market_order: false
