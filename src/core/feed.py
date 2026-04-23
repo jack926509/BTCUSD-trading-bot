@@ -424,7 +424,7 @@ class DataFeed:
 
     async def _reconcile_positions(self):
         try:
-            alpaca_positions = self.trading_client.get_all_positions()
+            alpaca_positions = await asyncio.to_thread(self.trading_client.get_all_positions)
             alpaca_symbols   = {p.symbol for p in alpaca_positions}
             local_symbols    = set(self.position_mgr.positions.keys())
 

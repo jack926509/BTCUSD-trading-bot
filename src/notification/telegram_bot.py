@@ -214,7 +214,8 @@ class TelegramNotifier:
         lines += [
             f"⏰ {_now_utc()}",
             "",
-            "💬 可用命令：/status /pause /resume /close /pnl /signals",
+            "💬 可用命令：/status /pnl /signals /stats",
+            "⚙️ 控制命令：/pause /resume /close /help",
         ]
         await self._send("\n".join(lines), reply_markup=self._dashboard_button())
 

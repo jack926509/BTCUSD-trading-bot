@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time as _time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -273,7 +274,6 @@ class PositionManager:
         )
         pos.trade_id           = trade_id
         # P2-1: 開倉後 90 秒 proximity alert 靜默，避免進場即爆告警
-        import time as _time
         pos._proximity_silent_until = _time.monotonic() + 90
         self.positions[symbol] = pos
         return pos
@@ -339,7 +339,6 @@ class PositionManager:
     # ── Tick Handler (Fast Track) ─────────────────────────────────────────────
 
     async def on_tick(self, symbol: str, price: float):
-        import time as _time
         pos = self.positions.get(symbol)
         if not pos or pos.state not in (PositionState.OPEN, PositionState.TRAILING):
             return
@@ -411,7 +410,6 @@ class PositionManager:
 
     async def _check_proximity_alert(self, pos, price: float):
         """T2 + P2-1：接近 TP/SL 0.2% 內推一次；開倉 90 秒內靜默"""
-        import time as _time
         if _time.monotonic() < pos._proximity_silent_until:
             return
         threshold = 0.002
@@ -517,57 +515,6 @@ class PositionManager:
             ),
             rollback_state=PositionState.TRAILING,
         )
-
-    async def _execute_tp1(self, pos: Position, price: float):
-        """TP1 部分平倉；之後 cancel+replace server stop 至成本附近。"""
-        if not self.executor:
-            return
-        try:
-            close_qty = round(pos.qty * self._tp1_close_pct, 8)
-            if pos.side == "BUY":
-                realized = (price - pos.entry_price) * close_qty
-            else:
-                realized = (pos.entry_price - price) * close_qty
-
-            await self.executor.partial_close(pos.symbol, pos.side, close_qty)
-
-            pos.qty          -= close_qty
-            pos.notional      = round(pos.entry_price * pos.qty, 2)
-            pos.realized_pnl += realized
-            pos.last_pnl      = realized
-            pos.stop_loss     = pos.entry_price  # Move SL to break-even
-
-            buf = self._hard_sl_buffer
-            new_hard_sl = round(
-                pos.entry_price * (1 - buf) if pos.side == "BUY" else pos.entry_price * (1 + buf),
-                2,
-            )
-            pos.hard_sl_price = new_hard_sl
-
-            new_stop_id = await self.executor.replace_server_side_stop(
-                old_order_id  = pos.server_stop_order_id,
-                side          = pos.side,
-                qty           = pos.qty,
-                hard_sl_price = new_hard_sl,
-                buffer_pct    = self._server_stop_buffer,
-            )
-            pos.server_stop_order_id = new_stop_id  # None 代表送失敗，上層已 CRITICAL alert
-
-            # 同步 DB 審計軌跡
-            if pos.trade_id:
-                try:
-                    await self.db.update_trade_stop_loss(
-                        pos.trade_id, pos.stop_loss, pos.hard_sl_price, new_stop_id,
-                    )
-                except Exception:
-                    pass
-
-            self.tg.mark_state_changed("SL_MOVED")
-            self._create_task(self.tg.notify_tp1(pos.symbol, pos, realized))
-
-        except Exception as e:
-            pos.state = PositionState.OPEN
-            await self.tg.alert(f"TP1 減倉失敗：{e}", level="WARNING")
 
     # ── Candle Close Handler ──────────────────────────────────────────────────
 

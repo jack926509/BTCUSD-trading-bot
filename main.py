@@ -3,7 +3,8 @@ import logging
 import os
 import signal
 import sys
-from datetime import datetime, timezone
+import time as _time
+from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
 
@@ -142,6 +143,7 @@ class TradingSystem:
         await self._refresh_equity()
         await self.executor.scan_orphan_orders_on_startup()
 
+
         is_paper = os.getenv("ALPACA_PAPER_MODE", "true").lower() == "true"
         await self.tg.notify_startup(
             self.circuit.state,
@@ -211,7 +213,6 @@ class TradingSystem:
             from alpaca.data.historical import CryptoHistoricalDataClient
             from alpaca.data.requests import CryptoBarsRequest
             from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
-            from datetime import timedelta
 
             hist_client = CryptoHistoricalDataClient(
                 api_key    = os.getenv("ALPACA_API_KEY"),
@@ -497,9 +498,10 @@ class TradingSystem:
     async def _on_position_close(self, pos, reason):
         """
         BE-C1 FIX: 所有出場路徑已在 PositionManager._execute_close 中完整處理
-        （circuit.record, db, tg 通知）。此 callback 只負責 risk PnL 追蹤。
+        （circuit.record, db, tg 通知）。此 callback 負責 risk PnL 追蹤並持久化。
         """
         self.risk.record_trade_pnl(pos.last_pnl)
+        await self.risk._persist()
 
     # ── Heartbeat Loop ────────────────────────────────────────────────────────
 
@@ -572,7 +574,6 @@ class TradingSystem:
             if now.hour == 0 and now.minute < 5 and last_daily_date != today_iso:
                 last_daily_date = today_iso
                 try:
-                    from datetime import timedelta
                     y = (now - timedelta(days=1)).strftime("%Y-%m-%d")
                     stats = await self._build_daily_recap(y)
                     await self.tg.notify_daily_recap(stats)
@@ -629,7 +630,6 @@ class TradingSystem:
         return stats
 
     async def _build_weekly_recap(self) -> dict:
-        from datetime import timedelta
         today = datetime.now(timezone.utc).date()
         last_sunday = today - timedelta(days=today.weekday() + 1)  # 上個週日
         daily_stats = []
@@ -701,13 +701,13 @@ class TradingSystem:
         第一次呼叫 → 記錄時間戳並回傳確認訊息；
         15 秒內第二次呼叫 → 真正執行平倉。
         """
-        import time as _time
         if not self.position_mgr.has_open_positions():
             self._close_confirm_at = 0.0
             return "ℹ️ 目前無持倉，無需平倉"
 
+        CONFIRM_WINDOW = 15
         now = _time.monotonic()
-        if now - self._close_confirm_at > 15:
+        if now - self._close_confirm_at > CONFIRM_WINDOW:
             self._close_confirm_at = now
             pos_list = []
             for symbol, pos in self.position_mgr.positions.items():
@@ -718,10 +718,10 @@ class TradingSystem:
                 f"{'─' * 24}\n"
                 + "\n".join(pos_list)
                 + f"\n{'─' * 24}\n"
-                + "15 秒內再輸入 <code>/close</code> 確認執行"
+                + f"⏳ <b>{CONFIRM_WINDOW} 秒內</b>再輸入 <code>/close</code> 確認執行\n"
+                + "（逾時自動取消，不影響持倉）"
             )
-
-        # 第二次 /close → 執行
+        # 第二次 /close（在 CONFIRM_WINDOW 內）→ 執行
         self._close_confirm_at = 0.0
         results = []
         for symbol, pos in list(self.position_mgr.positions.items()):
@@ -765,7 +765,6 @@ class TradingSystem:
 
     async def _tg_stats(self) -> str:
         """T4: 近 7 / 30 天統計（by source 勝率、平均 RRR、總損益）"""
-        from datetime import timedelta
         lines = ["📈 <b>策略統計</b>", "─" * 24]
         for days in (7, 30):
             total_pnl = 0.0
