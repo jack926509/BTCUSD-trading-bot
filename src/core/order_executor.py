@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
@@ -343,16 +344,35 @@ class OrderExecutor:
                 if is_wash_trade and not wash_trade_done:
                     # 清除衝突委託單後重試，不消耗 attempt 配額
                     wash_trade_done = True
+                    # 嘗試從 Alpaca 錯誤 JSON 取得精確的衝突委託單 ID
+                    conflicting_id: str | None = None
+                    try:
+                        err_data       = json.loads(err_str)
+                        conflicting_id = err_data.get("existing_order_id")
+                    except Exception:
+                        pass
+
                     log.warning(
                         "server stop rejected (wash trade 40310000), "
-                        "cancelling conflicting open orders and retrying"
+                        "conflicting_order=%s, cancelling and retrying",
+                        conflicting_id or "unknown",
                     )
                     await self.tg.alert(
                         "⚠️ Server Stop 遭 Wash Trade 拒絕（前次殘留委託單衝突）\n"
-                        "正在清除衝突委託單後重試…",
+                        f"衝突單 ID：{conflicting_id or '未知，將掃描所有衝突委託'}\n"
+                        "正在清除後重試…",
                         level="WARNING",
                     )
-                    n = await self._cancel_conflicting_open_orders(stop_side)
+                    if conflicting_id:
+                        # 精確取消，快速且無副作用
+                        try:
+                            await self._cancel_order(conflicting_id)
+                            n = 1
+                        except Exception as ce:
+                            log.warning("cancel conflicting order %s failed: %s", conflicting_id, ce)
+                            n = await self._cancel_conflicting_open_orders(stop_side)
+                    else:
+                        n = await self._cancel_conflicting_open_orders(stop_side)
                     log.info("wash-trade cleanup: cancelled %d conflicting orders", n)
                     await asyncio.sleep(1)  # 等 Alpaca 處理取消
                     continue                # 重試，attempt 不遞增
@@ -360,8 +380,17 @@ class OrderExecutor:
                 log.warning("server-side stop attempt %d/3 failed: %s", attempt + 1, e)
                 attempt += 1
                 if attempt >= 3:
+                    # 解析錯誤訊息，避免 Telegram 顯示原始 JSON
+                    try:
+                        err_data = json.loads(err_str)
+                        readable = (
+                            f"code={err_data.get('code', '?')}  "
+                            f"reason={err_data.get('reject_reason') or err_data.get('message', '?')}"
+                        )
+                    except Exception:
+                        readable = err_str[:300]
                     await self.tg.alert(
-                        f"伺服器端停損單送出失敗（3 次重試後放棄）：{e}",
+                        f"伺服器端停損單送出失敗（3 次重試後放棄）\n{readable}",
                         level="CRITICAL",
                     )
                     return None
