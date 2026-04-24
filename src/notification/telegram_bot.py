@@ -219,6 +219,92 @@ class TelegramNotifier:
         ]
         await self._send("\n".join(lines), reply_markup=self._dashboard_button())
 
+    # ── Signal Found Notification ─────────────────────────────────────────────
+
+    _CONDITION_LABELS: dict = {
+        "SWEEP":      "流動性掃盪確認",
+        "HTF_ALIGN":  "HTF 偏向對齊",
+        "OB":         "訂單塊支撐",
+        "FVG":        "公平價值缺口",
+        "CONFLUENCE": "OB+FVG 強匯聚",
+        "STRUCT_TP":  "結構性目標",
+        "ATR_SL":     "ATR 動態止損",
+    }
+
+    _SOURCE_LABELS: dict = {
+        "BOS":   "結構突破 (BOS)",
+        "CHOCH": "結構轉折 (CHoCH)",
+        "SWEEP": "掃盪回踩 (Sweep)",
+    }
+
+    @staticmethod
+    def _calc_signal_score(signal) -> int:
+        """Derive a 0–10 quality score from SMCSignal fields."""
+        score = 0
+        conds = set(getattr(signal, "conditions_met", []) or [])
+        if "HTF_ALIGN" in conds:   score += 2
+        if "CONFLUENCE" in conds:  score += 2
+        elif "OB" in conds:        score += 1
+        elif "FVG" in conds:       score += 1
+        if "STRUCT_TP" in conds:   score += 1
+        if "ATR_SL"    in conds:   score += 1
+        rrr = getattr(signal, "rrr", 0) or 0
+        if rrr >= 2.5:   score += 2
+        elif rrr >= 1.8: score += 1
+        return min(score, 10)
+
+    def _signal_reason_lines(self, signal) -> list:
+        """Return a list of Chinese reason strings for a signal."""
+        conds  = list(getattr(signal, "conditions_met", []) or [])
+        source = getattr(signal, "source", "")
+        lines  = []
+        if source in self._SOURCE_LABELS:
+            lines.append(self._SOURCE_LABELS[source])
+        for c in conds:
+            label = self._CONDITION_LABELS.get(c)
+            if label and label not in lines:
+                lines.append(label)
+        rrr = getattr(signal, "rrr", 0) or 0
+        if rrr:
+            lines.append(f"風報比 {rrr:.2f}R")
+        htf = getattr(signal, "htf_bias", "")
+        if htf and htf != "NEUTRAL":
+            lines.append(f"HTF {htf}")
+        return lines
+
+    async def notify_signal_found(self, symbol: str, signal, score: int = None):
+        """🔍 發現信號 — sent as soon as a valid signal is confirmed."""
+        if score is None:
+            score = self._calc_signal_score(signal)
+        direction  = getattr(signal, "direction", "BUY")
+        side_str   = "做多 🔺" if direction == "BUY" else "做空 🔻"
+        source     = getattr(signal, "source", "")
+        src_label  = self._SOURCE_LABELS.get(source, source)
+        reasons    = self._signal_reason_lines(signal)
+        reason_str = "、".join(reasons) if reasons else "—"
+
+        text = (
+            f"🔍 <b>發現信號</b>\n"
+            f"幣種：<b>{_esc(symbol)}</b>\n"
+            f"方向：{side_str}\n"
+            f"來源：{_esc(src_label)}\n"
+            f"評分：<b>{score} 分</b>\n"
+            f"原因：{_esc(reason_str)}"
+        )
+        await self._send(text)
+
+    # ── Stop Loss Order Status ─────────────────────────────────────────────────
+
+    async def notify_sl_placed(self, symbol: str, sl_price: float):
+        """🛡 止損單狀態 — sent after server-side stop is confirmed placed."""
+        text = (
+            f"🛡 <b>止損單狀態</b>\n"
+            f"幣種：{_esc(symbol)}\n"
+            f"止損價：<b>{sl_price}</b>\n"
+            f"狀態：✅ 已掛上"
+        )
+        await self._send(text)
+
     # ── Trade Open Notification ───────────────────────────────────────────────
 
     # ── T5 ASCII 結構圖 ───────────────────────────────────────────────────────
@@ -255,7 +341,8 @@ class TelegramNotifier:
     async def notify_trade_open(self, symbol: str, signal, description: str = "",
                                  risk_usd_abs: float = None,
                                  risk_pct_account: float = None,
-                                 trade_no_today: int = None):
+                                 trade_no_today: int = None,
+                                 margin_usd: float = None):
         direction = getattr(signal, "direction", "?")
         side_str  = "LONG 🔺" if direction == "BUY" else "SHORT 🔻"
         entry     = getattr(signal, "entry_limit_price", 0) or 0
@@ -310,6 +397,24 @@ class TelegramNotifier:
             direction=direction,
         )
 
+        # ── ✅ 開倉成功 clean summary (matches screenshot style) ──────────────
+        side_cn = "做多 🔺" if direction == "BUY" else "做空 🔻"
+        tp1_pct  = _pct(tp1 - entry if direction == "BUY" else entry - tp1, entry)
+        tp2_pct  = _pct(tp2 - entry if direction == "BUY" else entry - tp2, entry)
+        margin_line = (f"保證金：{margin_usd:.2f} USDT\n" if margin_usd is not None else "")
+        summary = (
+            f"✅ <b>開倉成功</b>\n"
+            f"幣種：{_esc(symbol)}\n"
+            f"方向：{side_cn}\n"
+            f"進場價：{entry}\n"
+            f"止損價：{sl}\n"
+            f"止盈 1：{tp1}　({tp1_pct})\n"
+            f"止盈 2：{tp2}　({tp2_pct})\n"
+            + margin_line
+        )
+        await self._send(summary)
+
+        # ── 📊 Detailed technical block ───────────────────────────────────────
         text = (
             f"📊 <b>開倉 · {_esc(symbol)} {side_str}</b>\n"
             f"{'─' * 24}\n"

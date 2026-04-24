@@ -354,6 +354,8 @@ class TradingSystem:
         direction   = job.signal.direction
         side_str    = "LONG 🔺" if direction == "BUY" else "SHORT 🔻"
 
+        await self.tg.notify_signal_found(job.symbol, job.signal)
+
         if self.risk.is_market_order_mode():
             await self.tg.alert(
                 f"🛒 市價單（測試模式）　{job.symbol} {side_str}\n"
@@ -401,10 +403,11 @@ class TradingSystem:
         )
         if server_stop_id:
             pos.server_stop_order_id = server_stop_id
+            await self.tg.notify_sl_placed(job.symbol, job.signal.hard_sl_price)
 
-        self._create_task(self._async_log_and_notify(job, pos))
+        self._create_task(self._async_log_and_notify(job, pos, notional))
 
-    async def _async_log_and_notify(self, job, pos):
+    async def _async_log_and_notify(self, job, pos, margin_usd: float = None):
         """Slow Track：Claude 描述、DB 寫入、Telegram 推播（含 T6 風險顯示）"""
         try:
             description = await self.claude.describe(job.symbol, job.signal)
@@ -427,6 +430,7 @@ class TradingSystem:
                 risk_usd_abs     = risk_usd_abs,
                 risk_pct_account = risk_pct,
                 trade_no_today   = trade_no,
+                margin_usd       = margin_usd,
             )
         except Exception as e:
             await self.tg.alert(f"Slow Track 記錄失敗：{e}", level="WARNING")
