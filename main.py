@@ -438,16 +438,28 @@ class TradingSystem:
     async def _verify_server_stops(self):
         """
         P0-4: 每次 heartbeat 驗證所有持倉的 server_stop 仍在 Alpaca。
-        若被外部取消 / 已觸發 / 狀態異常 → 補送一張新的 server stop。
+        若被外部取消 / 已觸發 / 狀態異常 → 先嘗試接管現有止損單，再補送。
         """
-        from alpaca.trading.enums import OrderStatus
+        from alpaca.trading.enums import OrderStatus, OrderSide as AOrderSide
         for symbol, pos in list(self.position_mgr.positions.items()):
             # 正在平倉時 server stop 已由 close_position 取消，不重送避免孤兒委託
             if pos.state in (PositionState.CLOSING, PositionState.CLOSED):
                 continue
 
+            stop_side = AOrderSide.SELL if pos.side == "BUY" else AOrderSide.BUY
+
             if not pos.server_stop_order_id:
-                # 本地已知沒 stop → 補一張
+                # 本地已知沒 stop → 先掃描 Alpaca 是否已有殘留的止損單（avoid duplicate / insufficient balance）
+                existing_id = await self.executor.find_existing_server_stop(stop_side)
+                if existing_id:
+                    pos.server_stop_order_id = existing_id
+                    await self.tg.alert(
+                        f"{symbol} 接管已存在的 server stop（order={existing_id}）",
+                        level="WARNING",
+                    )
+                    continue
+
+                # 真的沒有 → 補一張
                 try:
                     new_id = await self.executor.place_server_side_stop(
                         side          = pos.side,
@@ -485,16 +497,25 @@ class TradingSystem:
                     f"{symbol} server stop 已 {order.status}，重送保底",
                     level="CRITICAL",
                 )
-                try:
-                    new_id = await self.executor.place_server_side_stop(
-                        side          = pos.side,
-                        qty           = pos.qty,
-                        hard_sl_price = pos.hard_sl_price,
-                        buffer_pct    = self.risk.get_server_stop_buffer(),
+                # 先掃描是否已有替代的止損單（防止重複下單導致 insufficient balance）
+                existing_id = await self.executor.find_existing_server_stop(stop_side)
+                if existing_id and existing_id != pos.server_stop_order_id:
+                    pos.server_stop_order_id = existing_id
+                    await self.tg.alert(
+                        f"{symbol} 接管替代的 server stop（order={existing_id}）",
+                        level="WARNING",
                     )
-                    pos.server_stop_order_id = new_id
-                except Exception:
-                    pass
+                else:
+                    try:
+                        new_id = await self.executor.place_server_side_stop(
+                            side          = pos.side,
+                            qty           = pos.qty,
+                            hard_sl_price = pos.hard_sl_price,
+                            buffer_pct    = self.risk.get_server_stop_buffer(),
+                        )
+                        pos.server_stop_order_id = new_id
+                    except Exception:
+                        pass
 
     async def _force_close_all(self, reason: str):
         """風控上限觸發時強制平倉所有持倉（MANUAL_CLOSE reason 不計入熔斷器）"""

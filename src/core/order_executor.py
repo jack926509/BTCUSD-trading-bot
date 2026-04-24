@@ -327,8 +327,9 @@ class OrderExecutor:
             limit_price   = limit_price,
         )
 
-        attempt           = 0
-        wash_trade_done   = False   # wash trade 只清一次，避免無限迴圈
+        attempt              = 0
+        wash_trade_done      = False   # wash trade 只清一次，避免無限迴圈
+        balance_cleanup_done = False   # insufficient balance 清理只做一次
         while attempt < 3:
             try:
                 order = await self._submit(req)
@@ -339,6 +340,10 @@ class OrderExecutor:
                     "40310000" in err_str
                     or "wash trade"  in err_str.lower()
                     or "wash_trade"  in err_str.lower()
+                )
+                is_insuf_balance = (
+                    "insufficient balance" in err_str.lower()
+                    or "insufficient_balance" in err_str.lower()
                 )
 
                 if is_wash_trade and not wash_trade_done:
@@ -376,6 +381,21 @@ class OrderExecutor:
                     log.info("wash-trade cleanup: cancelled %d conflicting orders", n)
                     await asyncio.sleep(1)  # 等 Alpaca 處理取消
                     continue                # 重試，attempt 不遞增
+
+                if is_insuf_balance and not balance_cleanup_done:
+                    # 餘額不足：通常是舊的同向止損單仍佔用 BTC，清除後重試
+                    balance_cleanup_done = True
+                    log.warning(
+                        "server stop insufficient balance — cancelling stale same-side stops and retrying"
+                    )
+                    await self.tg.alert(
+                        "⚠️ Server Stop 餘額不足（舊止損單仍佔用），清除後重試…",
+                        level="WARNING",
+                    )
+                    n = await self._cancel_same_side_stops(stop_side)
+                    log.info("balance-recovery: cancelled %d stale same-side stop(s)", n)
+                    await asyncio.sleep(1)
+                    continue  # 重試，attempt 不遞增
 
                 log.warning("server-side stop attempt %d/3 failed: %s", attempt + 1, e)
                 attempt += 1
@@ -461,6 +481,45 @@ class OrderExecutor:
                          conflict_side, o.id, getattr(o, "limit_price", "?"))
             except Exception as e:
                 log.warning("cancel conflicting order %s failed: %s", o.id, e)
+        return cancelled
+
+    async def find_existing_server_stop(
+        self, stop_side: OrderSide, symbol: str = "BTC/USD"
+    ) -> str | None:
+        """Scan open orders for a stop/stop-limit of the same side as we want to place.
+        Returns the order ID if found, else None.  Used to adopt orphan server stops
+        instead of placing duplicates that would fail with 'insufficient balance'.
+        """
+        orders = await self._get_open_orders(symbol)
+        for o in orders:
+            if getattr(o, "side", None) != stop_side:
+                continue
+            order_type = str(getattr(o, "order_type", "") or "").lower()
+            if "stop" in order_type:
+                log.info("found existing server stop %s side=%s type=%s", o.id, stop_side, order_type)
+                return str(o.id)
+        return None
+
+    async def _cancel_same_side_stops(
+        self, stop_side: OrderSide, symbol: str = "BTC/USD"
+    ) -> int:
+        """Cancel all stop/stop-limit orders of the SAME side.
+        Called when 'insufficient balance' means a stale stop is already holding the funds.
+        """
+        orders    = await self._get_open_orders(symbol)
+        cancelled = 0
+        for o in orders:
+            if getattr(o, "side", None) != stop_side:
+                continue
+            order_type = str(getattr(o, "order_type", "") or "").lower()
+            if "stop" not in order_type:
+                continue
+            try:
+                await self._cancel_order(str(o.id))
+                cancelled += 1
+                log.info("cancelled stale same-side stop %s (balance recovery)", o.id)
+            except Exception as e:
+                log.warning("cancel stale stop %s failed: %s", o.id, e)
         return cancelled
 
     # ── Ghost Order 防護 ──────────────────────────────────────────────────────
