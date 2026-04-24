@@ -383,18 +383,44 @@ class OrderExecutor:
                     continue                # 重試，attempt 不遞增
 
                 if is_insuf_balance and not balance_cleanup_done:
-                    # 餘額不足：通常是舊的同向止損單仍佔用 BTC，清除後重試
+                    # 餘額不足：
+                    #   1. 清除同向孤兒止損單（釋放被鎖定的 BTC）
+                    #   2. 從 Alpaca 查詢實際持倉數量（pos.qty 可能與現實不符）
+                    #   3. 用實際數量重試（解決 pos.qty 10x 偏差問題）
                     balance_cleanup_done = True
                     log.warning(
-                        "server stop insufficient balance — cancelling stale same-side stops and retrying"
-                    )
-                    await self.tg.alert(
-                        "⚠️ Server Stop 餘額不足（舊止損單仍佔用），清除後重試…",
-                        level="WARNING",
+                        "server stop insufficient balance — cleaning stale stops and syncing qty from Alpaca"
                     )
                     n = await self._cancel_same_side_stops(stop_side)
                     log.info("balance-recovery: cancelled %d stale same-side stop(s)", n)
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(3)  # 等 Alpaca 處理取消
+
+                    # 從 Alpaca 取得真實持倉數量
+                    actual_qty = await self.get_alpaca_position_qty()
+                    if actual_qty and actual_qty > 0 and actual_qty < qty * 0.95:
+                        log.warning(
+                            "qty mismatch: requested=%.8f actual_alpaca=%.8f — using actual",
+                            qty, actual_qty,
+                        )
+                        await self.tg.alert(
+                            f"⚠️ Server Stop 餘額不足，數量已從 Alpaca 同步修正\n"
+                            f"原 qty={qty:.8f} → 實際={actual_qty:.8f}",
+                            level="WARNING",
+                        )
+                        qty = actual_qty
+                        req = StopLimitOrderRequest(
+                            symbol        = "BTC/USD",
+                            qty           = round(qty, 8),
+                            side          = stop_side,
+                            time_in_force = TimeInForce.GTC,
+                            stop_price    = stop_price,
+                            limit_price   = limit_price,
+                        )
+                    else:
+                        await self.tg.alert(
+                            "⚠️ Server Stop 餘額不足（舊止損單仍佔用），清除後重試…",
+                            level="WARNING",
+                        )
                     continue  # 重試，attempt 不遞增
 
                 log.warning("server-side stop attempt %d/3 failed: %s", attempt + 1, e)
@@ -415,6 +441,17 @@ class OrderExecutor:
                     )
                     return None
                 await asyncio.sleep(0.5 * (2 ** (attempt - 1)))
+
+    async def get_alpaca_position_qty(self, symbol: str = "BTC/USD") -> float | None:
+        """Return the actual qty held in Alpaca for the symbol, or None on error."""
+        try:
+            # Alpaca uses "BTCUSD" (no slash) for position lookup
+            alpaca_sym = symbol.replace("/", "")
+            pos = await asyncio.to_thread(self.client.get_open_position, alpaca_sym)
+            return float(pos.qty or 0)
+        except Exception as e:
+            log.warning("get_alpaca_position_qty(%s) failed: %s", symbol, e)
+            return None
 
     async def replace_server_side_stop(
         self, old_order_id: str, side: str, qty: float,
