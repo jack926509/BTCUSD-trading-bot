@@ -459,7 +459,17 @@ class TradingSystem:
                     )
                     continue
 
-                # 真的沒有 → 補一張
+                # 真的沒有 → 先同步 pos.qty，再補一張
+                actual_qty = await self.executor.get_alpaca_position_qty(symbol)
+                if actual_qty and actual_qty > 0 and actual_qty < pos.qty * 0.95:
+                    await self.tg.alert(
+                        f"⚠️ {symbol} pos.qty 與 Alpaca 不符，已同步\n"
+                        f"本地={pos.qty:.8f} → Alpaca={actual_qty:.8f}",
+                        level="WARNING",
+                    )
+                    pos.qty     = actual_qty
+                    pos.notional = round(pos.entry_price * actual_qty, 2)
+
                 try:
                     new_id = await self.executor.place_server_side_stop(
                         side          = pos.side,
@@ -506,6 +516,10 @@ class TradingSystem:
                         level="WARNING",
                     )
                 else:
+                    actual_qty = await self.executor.get_alpaca_position_qty(symbol)
+                    if actual_qty and actual_qty > 0 and actual_qty < pos.qty * 0.95:
+                        pos.qty     = actual_qty
+                        pos.notional = round(pos.entry_price * actual_qty, 2)
                     try:
                         new_id = await self.executor.place_server_side_stop(
                             side          = pos.side,
